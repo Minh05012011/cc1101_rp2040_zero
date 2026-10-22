@@ -248,6 +248,6 @@ Hiển thị phiên bản firmware, số mã đã lưu / tối đa (20), tần s
 
 - Bảng mã brute-force (`bruteforce_codes.h`) sinh từ tham khảo định nghĩa protocol của dự án [`flipperzero-bruteforce`](https://github.com/tobiabocchi/flipperzero-bruteforce) (xem header file để biết chi tiết nguồn/ngày sinh).
 - Thuật toán De Bruijn sequence (FKM algorithm) tham khảo Wikipedia: De Bruijn sequence.
-- Phần còn lại là firmware tự viết, không đi kèm giấy phép cụ thể trong repo gốc — tự bổ sung LICENSE phù hợp nếu bạn phát hành lại.
+- Phần còn lại là firmware tự viết, không đi kèm giấy phép cụ thể
 
 **Chỉ sử dụng thiết bị này trên hệ thống bạn sở hữu hoặc được phép thử nghiệm. Việc bắt/phát lại tín hiệu điều khiển không thuộc sở hữu của bạn có thể vi phạm pháp luật.**
