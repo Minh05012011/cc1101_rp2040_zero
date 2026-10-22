@@ -8,7 +8,7 @@ struct SavedCode {
     uint16_t T_us;
     bool     inverted;
     uint16_t repeats;
-    uint16_t freq_mhz;      // MHz integer (315)
+    uint32_t freq_khz;      // ★ v2: kHz (433920, 315000) — không còn truncate
     char     name[MAX_NAME_LEN];
 };
 
@@ -25,9 +25,11 @@ bool remove(int idx);                  // shifts following
 void clear();
 
 // Settings
-float    get_frequency();              // MHz
+float    get_frequency();              // MHz (float, đủ thập phân)
 void     set_frequency(float mhz);
 uint8_t  get_led_brightness();
 void     set_led_brightness(uint8_t b);
+uint8_t  get_max_bits();               // ★ v2
+void     set_max_bits(uint8_t bits);   // ★ v2
 
 } // namespace Storage

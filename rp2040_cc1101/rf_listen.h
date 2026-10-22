@@ -40,20 +40,20 @@ struct RFResult {
 // Config
 // ---------------------------------------------------------------------------
 struct RFListenerConfig {
-    uint8_t  pin_sck;
-    uint8_t  pin_mosi;
-    uint8_t  pin_miso;
-    uint8_t  pin_csn;
-    uint8_t  pin_gdo0;
-    float    frequency_mhz;
-    int      scan_threshold_dbm;
-    uint32_t frame_gap_ms;
-    uint32_t noise_filter_us;
-    uint32_t settle_time_ms;
-    bool     verbose;
-    // ★ v2
-    bool     agc_sensitive;     // true = dùng AGC nhạy hơn cho remote yếu
-    uint8_t  min_confidence;    // ngưỡng confidence tối thiểu để publish (0=tắt)
+    uint8_t  pin_sck;            // 1
+    uint8_t  pin_mosi;           // 2
+    uint8_t  pin_miso;           // 3
+    uint8_t  pin_csn;            // 4
+    uint8_t  pin_gdo0;           // 5
+    float    frequency_mhz;      // 6
+    int      scan_threshold_dbm; // 7  ← -70 phải rơi vào đây (int, giữ dấu âm)
+    uint32_t frame_gap_ms;       // 8
+    uint32_t noise_filter_us;    // 9
+    uint32_t settle_time_ms;     // 10
+    bool     verbose;            // 11
+    bool     agc_sensitive;      // 12
+    uint8_t  min_confidence;     // 13
+    uint8_t  max_bits;           // 14 ← max_bits PHẢI Ở CUỐI
 };
 
 #define RF_LISTENER_DEFAULT_CONFIG {        \
@@ -67,7 +67,8 @@ struct RFListenerConfig {
     /* settle */ 4,                         \
     /* verbose */ true,                     \
     /* agc_sensitive */ true,               \
-    /* min_confidence */ 0                  \
+    /* min_confidence */ 0,                 \
+    /* max_bits */ 32                       \
 }
 
 // ---------------------------------------------------------------------------

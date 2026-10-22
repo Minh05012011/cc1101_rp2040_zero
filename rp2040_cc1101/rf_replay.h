@@ -208,5 +208,17 @@ void rf_replay_load_builtin_protocols();
 uint8_t rf_replay_read_register(uint8_t addr);
 uint8_t rf_replay_read_status(uint8_t addr);
 void    rf_replay_dump_registers(Stream& out = Serial);
+// ---------------------------------------------------------------------------
+// ★ De Bruijn support: phát bit trực tiếp qua GDO0
+// ---------------------------------------------------------------------------
+void rf_replay_transmit_bit_high(uint16_t duration_us);
+void rf_replay_transmit_bit_low(uint16_t duration_us);
 
+// Phát một chuỗi bit thô (mỗi bit = 1 mức HIGH/LOW trong T_us)
+// bits: con trỏ tới mảng uint8_t (mỗi phần tử 0 hoặc 1)
+// len: số bit
+// T_us: thời gian mỗi bit
+// repeats: số lần lặp
+void rf_replay_transmit_raw_bits(const uint8_t* bits, uint32_t len,
+                                 uint16_t T_us, uint16_t repeats = 1);
 #endif // RF_REPLAY_H

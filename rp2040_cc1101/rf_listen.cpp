@@ -578,7 +578,7 @@ static void publish_result(const Packet &bp, int8_t rssi) {
     g_result.inverted = bp.inverted;
     strncpy(g_result.protocol, bp.protocol, sizeof(g_result.protocol) - 1);
     g_result.protocol[sizeof(g_result.protocol) - 1] = 0;
-    g_result.frequency_mhz_x1000 = (uint32_t)(g_cfg.frequency_mhz * 1000);
+        g_result.frequency_mhz_x1000 = (uint32_t)(g_cfg.frequency_mhz * 1000.0f + 0.5f);
     g_result.timestamp_ms = millis();
     g_result.rssi_dbm  = rssi;
     g_result.confidence = bp.confidence;
@@ -595,7 +595,15 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
     if (n < 6) return false;
 
     uint32_t T = estimate_T(dur, n, g_cfg.noise_filter_us);
-    if (T < 80 || T > 2500) {
+
+    // ★ v2: Layer 1 — loại nhiễu xung ngắn (89µs, 100µs từ log thực tế)
+    // Remote thật: EV1527/PT2262 ≥ 250µs, Came/Nice ≥ 185µs
+    if (T < 150) {
+        if (printRaw && g_cfg.verbose)
+            Serial.printf("⚠ T=%luµs < 150 → noise\n", (unsigned long)T);
+        return false;
+    }
+    if (T > 2500) {
         if (printRaw && g_cfg.verbose) Serial.println(F("⚠ T ngoài dải"));
         return false;
     }
@@ -605,14 +613,22 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
     if (nSync < 1) {
         // ★ v2: thử decode không cần sync (một số protocol đơn giản)
         Packet pkt{};
-        if (decode_multi_T(dur, lvl, n, T, 0, n - 1, pkt) && pkt.bits >= 8) {
+        if (decode_multi_T(dur, lvl, n, T, 0, n - 1, pkt) && pkt.bits >= 12) {
+            // ★ Layer 6: chặn rác dài (54–60 bit) trước khi label/cache
+            if (pkt.bits > g_cfg.max_bits) {
+                if (printRaw && g_cfg.verbose)
+                    Serial.printf("⚠ NO-SYNC %u bit > max(%u) → bỏ qua\n",
+                                  pkt.bits, g_cfg.max_bits);
+                return false;
+            }
             label_protocol(pkt);
             if (pkt.confidence >= 60) {
                 cache_clean();
                 cache_put(pkt);
                 if (g_cfg.verbose)
                     Serial.printf("  ✓ NO-SYNC  %-16s | %u bit | 0x%llX | conf=%u\n",
-                                  pkt.protocol, pkt.bits, (unsigned long long)pkt.payload, pkt.confidence);
+                                  pkt.protocol, pkt.bits,
+                                  (unsigned long long)pkt.payload, pkt.confidence);
                 publish_result(pkt, rssi);
                 return true;
             }
@@ -650,10 +666,12 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
     if (nFilt == 0)
         for (uint16_t i = 0; i < nPkt; i++)
             if (packets[i].bits >= 12) filtered[nFilt++] = packets[i];
-    if (nFilt == 0)
-        for (uint16_t i = 0; i < nPkt; i++)
-            if (packets[i].bits >= 8)  filtered[nFilt++] = packets[i];
-    if (nFilt == 0) return false;
+    // ★ v2: bỏ fallback ≥8 — nhiễu 0xF0 (8 bit) không còn lọt
+    if (nFilt == 0) {
+        if (printRaw && g_cfg.verbose)
+            Serial.println(F("⚠ Tất cả packet < 12 bit → noise"));
+        return false;
+    }
 
     Group groups[RF_LISTEN_MAX_PACKETS];
     uint16_t nG = group_packets(filtered, nFilt, groups, RF_LISTEN_MAX_PACKETS);
@@ -670,6 +688,14 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
 
     const Packet &bp  = groups[best_g].best;
     uint16_t      cnt = groups[best_g].count;
+
+    // ★ v2: Layer 6 — lọc theo max_bits do user cấu hình
+    if (bp.bits > g_cfg.max_bits) {
+        if (g_cfg.verbose)
+            Serial.printf("⚠ %u bit > max(%u) → nghi rác\n",
+                          bp.bits, g_cfg.max_bits);
+        return false;
+    }
 
     cache_clean();
     int cached = cache_find(bp);

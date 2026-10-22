@@ -18,7 +18,22 @@
 #define PIN_BTN_RIGHT  13
 
 #define PIN_LED        16
+// ---------------------------------------------------------------------------
+// RF defaults
+// ---------------------------------------------------------------------------
+#define DEFAULT_FREQ_MHZ     315.000f
+#define DEFAULT_REPEATS      15
+#define DEFAULT_LED_BRIGHT   40
+// ---------------------------------------------------------------------------
+// ★ De Bruijn Sequence
+// ---------------------------------------------------------------------------
+#define DEBRUIJN_DEFAULT_BITS    12      // Mặc định 12-bit cho cổng fixed-code
+#define DEBRUIJN_DEFAULT_T_US    350     // 1T = 350µs (EV1527-like)
+#define DEBRUIJN_MAX_BITS        16      // Giới hạn an toàn (65536 bit)
 
+#define MIN_MAX_BITS         8
+#define MAX_MAX_BITS         64
+#define DEFAULT_MAX_BITS     32
 // ---------------------------------------------------------------------------
 // OLED
 // ---------------------------------------------------------------------------
@@ -32,7 +47,8 @@
 #define MAX_SAVED_CODES  20
 #define MAX_NAME_LEN     12
 #define EEPROM_SIZE      1024
-#define STORAGE_MAGIC    0x52464454UL   // "RFDT"
+// ★ v2: layout mới (freq_khz uint32_t + CODE_SIZE=32) → bump magic để tự reset
+#define STORAGE_MAGIC    0x52464455UL   // "RFDU"
 
 // ---------------------------------------------------------------------------
 // Buttons
@@ -44,5 +60,5 @@
 // RF defaults
 // ---------------------------------------------------------------------------
 #define DEFAULT_FREQ_MHZ     315.000f
-#define DEFAULT_REPEATS      2
+#define DEFAULT_REPEATS      15
 #define DEFAULT_LED_BRIGHT   40
