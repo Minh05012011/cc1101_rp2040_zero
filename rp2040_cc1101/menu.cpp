@@ -10,22 +10,100 @@
 #include <math.h>
 #include "debruijn.h"
 #include "advanced_capture.h"
-namespace Menu {
+#include "jammer.h"
+#include "rf_raw_capture.h"
 
+
+
+namespace Menu {
+// Danh sách tần số jam — tập trung vào các band phổ biến
+// Ghi chú: các tần số trong cùng 1 band CC1101 (300-348, 387-464, 779-928)
+// sẽ SCAL nhanh hơn. Trộn nhiều band thì mỗi lần đổi chậm hơn.
+static const float JAM_FREQS[] = {
+    // ── Band 315 MHz (CC1101 band 1) ─────────────────────────
+    310.000f, 312.000f, 313.000f, 314.350f, 315.000f,
+    // ── Band 433 MHz (CC1101 band 2) — phổ biến nhất ─────────
+    418.000f, 430.000f, 433.050f, 433.420f, 433.920f,
+    434.075f, 434.420f, 434.775f, 438.900f, 440.175f,
+    // ── Band 868 MHz (CC1101 band 4) ─────────────────────────
+    868.300f, 868.800f,
+};
+// ==== NEW JAMMER (Jammer namespace) ====
+static const float HOP_315_BAND[] = {
+    310.000f, 312.000f, 313.000f, 314.350f, 315.000f
+};
+// ★ Range builder cho Custom OOK (a-b)
+#define MAX_RANGE_FREQS  512
+static float g_range_freqs[MAX_RANGE_FREQS];
+static int   g_range_count = 0;
+
+static int build_range_freqs(float start, float stop) {
+    if (start >= stop) return 0;
+    float span = stop - start;
+    float step;
+    if      (span <= 20.0f)  step = 0.2f;
+    else if (span <= 50.0f)  step = 0.5f;
+    else if (span <= 150.0f) step = 1.0f;
+    else                     step = 2.0f;
+
+    int n = 0;
+    for (float f = start; f <= stop + 0.001f && n < MAX_RANGE_FREQS; f += step) {
+        // CC1101 chỉ tune được 3 band này
+        bool valid = (f >= 300.0f && f <= 348.0f) ||
+                     (f >= 387.0f && f <= 464.0f) ||
+                     (f >= 779.0f && f <= 928.0f);
+        if (valid) g_range_freqs[n++] = f;
+    }
+    g_range_count = n;
+    return n;
+}
+static const float HOP_ALL_BANDS[] = {
+    // 315 band
+    310.000f, 312.000f, 315.000f,
+    // 433 band
+    418.000f, 430.000f, 433.050f, 433.420f, 433.920f,
+    434.075f, 434.420f, 434.775f,
+    // 868 band
+    868.300f, 868.800f,
+};
+static const char* JAMMER_MENU_ITEMS[] = {
+    "OOK 315 )",      // 0
+    "OOK 433 ",      // 1
+    "OOK Custom Freq",      // 2
+    "CW 315 ",       // 3
+    "CW 433 ",       // 4
+    "Custom CW",            // 5
+    "Hop 315 Band",         // 6
+    "Hop All Bands",        // 7
+    "Spam EV1527",          // 8
+    "Back"                  // 9
+};
+static const int JAMMER_MENU_COUNT =
+    sizeof(JAMMER_MENU_ITEMS) / sizeof(JAMMER_MENU_ITEMS[0]);
+static int g_jammer_menu_idx = 0;
+static const size_t JAM_FREQ_COUNT = sizeof(JAM_FREQS) / sizeof(JAM_FREQS[0]);
+static const uint16_t JAM_DWELL_MS = 25;   // thời gian mỗi tần số (ms)
 // ===========================================================================
 // States
 // ===========================================================================
 enum State {
-    ST_BOOT = 0, ST_MAIN, ST_SCAN, ST_CAPTURE, ST_CAPTURE_DONE,
-    ST_SAVED_LIST, ST_SAVED_DETAIL, ST_REPLAY, ST_JAMMER,ST_BRUCE_DEBRUIJN_MENU,
-ST_BRUCE_DEBRUIJN_RUNNING,
+    ST_BOOT = 0, ST_MAIN, ST_SCAN_MENU, ST_SCAN_HISTORY, ST_SCAN, ST_CAPTURE, ST_CAPTURE_DONE,
+    ST_SAVED_LIST, ST_SAVED_DETAIL, ST_REPLAY, ST_JAMMER, ST_BRUCE_DEBRUIJN_MENU,
+    ST_BRUCE_DEBRUIJN_RUNNING,
     ST_JAMMER_ALL,
     ST_BRUCE_MENU, ST_BRUCE_RUNNING,
     ST_SETTINGS, ST_ABOUT,
     // ★ Advanced Capture
     ST_CAPTURE_MENU, ST_ADV_CAPTURE, ST_ADV_RESULT,
-    // ★ Multi-Button 4-Bit Remote Analysis
-    ST_SAVED_MODE_SELECT, ST_SAVED_BTN_COUNT, ST_SAVED_BTN_TX
+    // ★ Multi-Button 8-Bit Remote Analysis
+    ST_SAVED_MODE_SELECT, ST_SAVED_BTN_COUNT, ST_SAVED_BTN_TX,
+    ST_AUTO_BTN_DETAIL,
+    ST_JAM_MODE_SELECT,
+    ST_JAM_DELAY_SPEED,
+    ST_JAM_RUNNING,
+        ST_RAW_CAPTURE,
+    ST_RAW_RESULT,
+    ST_JAMMER_MENU          
 };
 // ★ De Bruijn state
 static int      g_db_bits       = DEBRUIJN_DEFAULT_BITS;
@@ -53,6 +131,85 @@ static const char* MAIN_ITEMS[] = {
 };
 static const int MAIN_COUNT = 7;
 
+// ★ v3.1: Live Scan sub-menu — Full Range / 433+315 MHz Fast / History
+static int g_scan_menu_idx = 0;
+static const int   SCAN_MENU_COUNT = 3;
+// ★ v3.3: Scan history — DYNAMIC, không còn giới hạn 20 entry
+// Chỉ latch chống nhiễu bị reset mỗi phiên scan mới;
+// lịch sử tần số (kể cả trùng) được giữ xuyên suốt các phiên.
+#define SCAN_HIST_INIT_CAP  20
+#define SCAN_HIST_MAX_CAP   512     // ~4KB SRAM (8 bytes/entry) — max an toàn
+// ★ v3.4: thêm session_id để đánh dấu ranh giới giữa các phiên scan
+struct ScanHistEntry {
+    float    freq_mhz;
+    int      rssi_dbm;
+    uint16_t session_id;   // nhóm các entry thuộc cùng 1 phiên live scan
+};
+static ScanHistEntry* g_scan_hist        = nullptr;
+static int            g_scan_hist_cap    = 0;
+static int            g_scan_hist_count  = 0;
+static int            g_scan_hist_idx    = 0;
+static float          g_scan_hist_scroll = 0.0f;
+static uint16_t       g_scan_hist_session_id = 0;   // ★ tăng mỗi lần vào scan mới
+
+// Cấp phát / mở rộng buffer khi cần
+static bool scan_hist_grow(int needed) {
+    if (needed <= g_scan_hist_cap) return true;
+    int new_cap = (g_scan_hist_cap > 0) ? g_scan_hist_cap : SCAN_HIST_INIT_CAP;
+    while (new_cap < needed && new_cap < SCAN_HIST_MAX_CAP) new_cap *= 2;
+    if (new_cap > SCAN_HIST_MAX_CAP) new_cap = SCAN_HIST_MAX_CAP;
+    if (needed > new_cap) return false;
+    ScanHistEntry* np = (ScanHistEntry*)realloc(
+        g_scan_hist, (size_t)new_cap * sizeof(ScanHistEntry));
+    if (!np) return false;
+    g_scan_hist     = np;
+    g_scan_hist_cap = new_cap;
+    return true;
+}
+static void scan_hist_push(float freq, int rssi) {
+    if (!scan_hist_grow(g_scan_hist_count + 1)) {
+        // Đã đạt MAX_CAP → FIFO: bỏ entry cũ nhất, chèn lên đầu
+        if (g_scan_hist_count == 0) return;
+        for (int i = g_scan_hist_count - 1; i > 0; --i) {
+            g_scan_hist[i] = g_scan_hist[i - 1];
+        }
+        g_scan_hist[0].freq_mhz   = freq;
+        g_scan_hist[0].rssi_dbm   = rssi;
+        g_scan_hist[0].session_id = g_scan_hist_session_id;   // ★
+        return;
+    }
+    for (int i = g_scan_hist_count; i > 0; --i) {
+        g_scan_hist[i] = g_scan_hist[i - 1];
+    }
+    g_scan_hist[0].freq_mhz   = freq;
+    g_scan_hist[0].rssi_dbm   = rssi;
+    g_scan_hist[0].session_id = g_scan_hist_session_id;       // ★
+    g_scan_hist_count++;
+}
+#define SCAN_HIST_HOLD_MS   3000
+#define SCAN_HIST_FREQ_TOL  8.0f   // MHz — độ rộng coi là "cùng 1 cụm"
+static bool     g_scan_hist_has_latch  = false;
+static float    g_scan_hist_latch_freq = 0.0f;
+static uint32_t g_scan_hist_latch_ms   = 0;
+
+static void scan_hist_reset_latch() { g_scan_hist_has_latch = false; }
+
+static void scan_hist_on_hit(float freq, int rssi) {
+    uint32_t now = millis();
+    bool same_cluster = g_scan_hist_has_latch &&
+                         fabsf(freq - g_scan_hist_latch_freq) < SCAN_HIST_FREQ_TOL;
+
+    if (same_cluster && (now - g_scan_hist_latch_ms) < SCAN_HIST_HOLD_MS) {
+        return;   // vẫn trong thời gian giữ của cùng 1 cụm → bỏ qua
+    }
+
+    // Tần số mới khác cụm, HOẶC cụm cũ đã hết thời gian giữ → ghi + latch lại
+    scan_hist_push(freq, rssi);
+    g_scan_hist_has_latch  = true;
+    g_scan_hist_latch_freq = freq;
+    g_scan_hist_latch_ms   = now;
+}
+
 static int g_settings_idx = 0;
 static const char* SET_ITEMS[] = {"Frequency", "LED Bright", "Max bits","Clear Flash"};
 static const int   SET_COUNT = 4;
@@ -63,23 +220,42 @@ static bool g_delete_confirm = false;
 static float g_main_scroll = 0.0f;
 static float g_saved_scroll = 0.0f;
 
-// ★ Multi-Button 4-Bit Remote Analysis
-static int      g_saved_mode_idx   = 0; // 0 = 4-Bit Remote, 1 = Code Detail
+// ★ Multi-Button 8-Bit Remote Analysis
+static int      g_saved_mode_idx   = 0; // 0 = 8-Bit Remote, 1 = Code Detail
 static uint8_t  g_remote_root_cmd  = 0; // 4-bit command (0..15)
-static int      g_remote_root_btn  = 1; // 1..4
-static int      g_btn_count        = 3; // 2..4
+static int      g_remote_root_btn  = 1; // 1..8
+static int      g_btn_count        = 8; // 8 buttons
 
 struct RemoteBtn {
-    char     label[16];
+    char     label[20];
+    char     name[MAX_NAME_LEN];
     uint64_t payload;
     uint8_t  cmd;
     bool     is_root;
+    bool     saved_to_lib;
 };
-static RemoteBtn g_remote_btns[4];
-static int       g_remote_btn_count = 0;
-static int       g_remote_btn_idx   = 0;
-static uint32_t  g_btn_tx_ms        = 0;
-static bool      g_btn_tx_ok        = false;
+static RemoteBtn g_remote_btns[8];
+static int       g_remote_btn_count   = 8;
+static int       g_remote_btn_idx     = 0;
+static int       g_auto_btn_action    = 0; // 0=TX, 1=JAM, 2=REN
+static uint32_t  g_btn_tx_ms          = 0;
+static bool      g_btn_tx_ok          = false;
+static uint32_t  g_btn_save_notify_ms = 0;
+
+// ★ Jammer State (Continuous & Jam Delay)
+enum JamRunMode {
+    JAM_MODE_CONT = 0,
+    JAM_MODE_DELAY
+};
+static JamRunMode g_jam_mode = JAM_MODE_CONT;
+static int        g_jam_mode_sel = 0; // 0=Jamming (Cont), 1=Jam Delay
+static int        g_jam_speed_idx = 0; // 0=Low (1.0s), 1=Med (0.5s), 2=High (250ms)
+static uint32_t   g_jam_delay_interval_ms = 1000;
+static uint32_t   g_jam_last_burst_ms = 0;
+static uint32_t   g_jam_burst_count = 0;
+static uint32_t   g_jam_total_pkts = 0;
+static State      g_jam_return_state = ST_SAVED_DETAIL;
+static bool       g_jam_is_bursting = false;
 
 // ---------------------------------------------------------------------------
 // Nav repeat helper
@@ -94,6 +270,7 @@ static NavRepeat g_main_left_nav, g_main_right_nav;
 static NavRepeat g_saved_left_nav, g_saved_right_nav;
 static NavRepeat g_settings_left_nav, g_settings_right_nav;
 static NavRepeat g_bf_left_nav, g_bf_right_nav;
+static NavRepeat g_scan_hist_left_nav, g_scan_hist_right_nav;
 
 static bool nav_step(HW::Btn button, HW::Ev event, int direction,
                      int& index, int count, NavRepeat& nav) {
@@ -123,7 +300,35 @@ static bool nav_step(HW::Btn button, HW::Ev event, int direction,
     }
     return changed;
 }
-
+// ★ v3.5: giống nav_step nhưng KHÔNG wrap vòng tròn — dùng cho history
+static bool nav_step_clamped(HW::Btn button, HW::Ev event, int direction,
+                             int& index, int count, NavRepeat& nav) {
+    const uint32_t now = millis();
+    const bool down = HW::is_pressed(button);
+    bool changed = false;
+    if (down) {
+        if (!nav.held) {
+            nav.held = true;
+            nav.repeated = false;
+            nav.started_ms = now;
+            nav.last_step_ms = now;
+        } else if ((now - nav.started_ms) >= 320 &&
+                   (now - nav.last_step_ms) >= 88) {
+            int next = index + direction;
+            if (next >= 0 && next < count) { index = next; changed = true; }
+            nav.last_step_ms = now;
+            nav.repeated = true;
+        }
+    } else {
+        if (event == HW::EV_CLICK && !nav.repeated) {
+            int next = index + direction;
+            if (next >= 0 && next < count) { index = next; changed = true; }
+        }
+        nav.held = false;
+        nav.repeated = false;
+    }
+    return changed;
+}
 // ---------------------------------------------------------------------------
 // Captured + play state
 // ---------------------------------------------------------------------------
@@ -131,6 +336,7 @@ static RFResult  g_cap_result = {};
 static bool      g_cap_has    = false;
 static SavedCode g_play       = {};
 static bool      g_play_ok    = false;
+static int       g_play_idx_raw = -1;   // ★ slot raw đang được replay
 
 // Jammer state
 static uint32_t g_jammer_enter_ms = 0;
@@ -205,7 +411,8 @@ static void draw_header(const char* title) {
 // ===========================================================================
 static bool emergency_check() {
     if (g_state == ST_BOOT || g_state == ST_JAMMER || g_state == ST_JAMMER_ALL
-        || g_state == ST_BRUCE_RUNNING || g_state == ST_ADV_CAPTURE) return false;
+        || g_state == ST_JAM_RUNNING || g_state == ST_BRUCE_RUNNING
+        || g_state == ST_ADV_CAPTURE || g_state == ST_RAW_CAPTURE) return false;
     if (HW::is_long_pressed(HW::BTN_MID, 3000)) {
         Serial.println(F("[EXIT] M-hold 3s -> MAIN"));
         if (Keyboard::is_active()) Keyboard::close();
@@ -270,7 +477,9 @@ static void render_scan() {
     d.clearDisplay();
     const float pk   = rf_listen_get_last_peak_freq();
     const int   rssi = rf_listen_get_last_peak_rssi();
-    const bool  valid = (pk > 0.0f && rssi > -200);
+    // ★ v3: chỉ coi là "valid" khi đây thực sự là 1 tín hiệu bắt được
+    //        (không phải noise floor trong lúc đang quét) — fix hiển thị sai dBm
+    const bool  valid = rf_listen_last_peak_is_hit();
     char b[24];
     d.setTextSize(1);
     if (valid) snprintf(b, sizeof(b), "%.3f MHz", pk);
@@ -323,51 +532,170 @@ static void render_scan() {
     else d.print("SIGNAL: WEAK");
 
     // Header vàng đè lên trên cùng
-    draw_header("LIVE SCAN");
+    draw_header(rf_listen_get_scan_band() == RF_SCAN_BAND_FAST
+                ? "LIVE SCAN - FAST" : "LIVE SCAN - FULL");
 }
 
 // ---------------------------------------------------------------------------
-// ★ CAPTURE sub-menu render — Giao diện thiết kế mới hiện đại, dạng 2 Card
+// ★ v3.1: Live Scan sub-menu — Full Range / 433+315 MHz Fast
 // ---------------------------------------------------------------------------
+static void render_scan_menu() {
+    auto& d = HW::oled;
+    d.clearDisplay();
+
+    // Card 0: Full Range (y=17..28)
+    const bool s0 = (g_scan_menu_idx == 0);
+    if (s0) { d.fillRoundRect(2, 17, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_BLACK, SSD1306_WHITE); }
+    else    { d.drawRoundRect(2, 17, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_WHITE, SSD1306_BLACK); }
+    d.setCursor(6, 19); d.print(s0 ? "> FULL RANGE" : "  FULL RANGE");
+
+    // Card 1: Fast 433/315 (y=31..42)
+    const bool s1 = (g_scan_menu_idx == 1);
+    if (s1) { d.fillRoundRect(2, 31, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_BLACK, SSD1306_WHITE); }
+    else    { d.drawRoundRect(2, 31, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_WHITE, SSD1306_BLACK); }
+    d.setCursor(6, 33); d.print(s1 ? "> 433/315 FAST" : "  433/315 FAST");
+
+    // Card 2: History (y=45..56)
+    const bool s2 = (g_scan_menu_idx == 2);
+    if (s2) { d.fillRoundRect(2, 45, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_BLACK, SSD1306_WHITE); }
+    else    { d.drawRoundRect(2, 45, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_WHITE, SSD1306_BLACK); }
+    char hbuf[20];
+    snprintf(hbuf, sizeof(hbuf), "%s HISTORY (%d)", s2 ? ">" : " ", g_scan_hist_count);
+    d.setCursor(6, 47); d.print(hbuf);
+
+    d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    d.setCursor(4, 58);
+    d.print("L/R:SEL  M:OK  L-L:BACK");
+
+    draw_header("LIVE SCAN");
+}
+// ---------------------------------------------------------------------------
+// ★ v3.3: Scan history list — có SCROLLBAR bên phải + hỗ trợ N entry
+// ---------------------------------------------------------------------------
+static void render_scan_history() {
+    auto& d = HW::oled;
+    d.clearDisplay();
+    d.setTextSize(1);
+
+    const int total   = g_scan_hist_count;
+    const int visible = 5;
+
+    if (total == 0) {
+        d.setCursor(10, 30);
+        d.print("NO HISTORY YET");
+        d.setCursor(4, 58);
+        d.print("L-L: BACK");
+        draw_header("SCAN HISTORY");
+        return;
+    }
+
+    // Smooth scroll (giữ nguyên logic cũ)
+    float target = (float)(g_scan_hist_idx - (visible - 1));
+    if (target < 0.0f) target = 0.0f;
+    const float maxOffset = (float)max(0, total - visible);
+    if (target > maxOffset) target = maxOffset;
+    g_scan_hist_scroll += (target - g_scan_hist_scroll) * 0.32f;
+    if (fabsf(target - g_scan_hist_scroll) < 0.035f) g_scan_hist_scroll = target;
+
+    // Vẽ scrollbar hay không tuỳ tổng số entry có vượt quá 5 dòng không
+    const bool show_sb = (total > visible);
+    const int  sb_line_x  = 125;
+    const int  sb_thumb_x = 124;
+    const int  sb_y       = 17;
+    const int  sb_h       = 35;   // y=17..51
+    const int  sb_thumb_h = 7;
+
+        for (int i = 0; i < total; ++i) {
+        const int y = (int)lroundf(18.0f + ((float)i - g_scan_hist_scroll) * 9.0f);
+        if (y < 16 || y > 62) continue;
+
+        const bool sel = (i == g_scan_hist_idx);
+        const int  row_w = show_sb ? 122 : 126;
+
+        if (sel) d.fillRoundRect(1, y, row_w, 8, 2, SSD1306_WHITE);
+        d.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE,
+                       sel ? SSD1306_WHITE : SSD1306_BLACK);
+        d.setCursor(3, y); d.print(sel ? ">" : " ");
+
+        char line[24];
+        snprintf(line, sizeof(line), "%.3fM %ddB",
+                 g_scan_hist[i].freq_mhz, g_scan_hist[i].rssi_dbm);
+        d.setCursor(13, y); d.print(line);
+        d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+
+        // ★ v3.4: vẽ dải phân cách khi entry kế tiếp thuộc phiên scan khác
+        if (i + 1 < total &&
+            g_scan_hist[i].session_id != g_scan_hist[i + 1].session_id) {
+            const int sep_y = y + 8;   // nằm trong khe 1px giữa 2 dòng (step=9)
+            if (sep_y >= 16 && sep_y <= 62) {
+                const int x_end = show_sb ? 122 : 125;
+                // Chấm dashed cách nhau 2px → trông như "---" nhưng gọn
+                for (int x = 4; x < x_end; x += 3) {
+                    d.drawPixel(x, sep_y, SSD1306_WHITE);
+                }
+            }
+        }
+    }
+
+    // ── SCROLLBAR ──
+    if (show_sb) {
+        // Đường ray
+        d.drawFastVLine(sb_line_x, sb_y, sb_h, SSD1306_WHITE);
+
+        // Vị trí thumb dựa vào vị trí scroll thực tế (khớp animation)
+        int thumb_y;
+        if (total <= 1) {
+            thumb_y = sb_y;
+        } else {
+            float ratio = g_scan_hist_scroll / maxOffset;
+            if (ratio < 0.0f) ratio = 0.0f;
+            if (ratio > 1.0f) ratio = 1.0f;
+            thumb_y = sb_y + (int)lroundf(ratio * (float)(sb_h - sb_thumb_h));
+        }
+        d.fillRect(sb_thumb_x, thumb_y, 3, sb_thumb_h, SSD1306_WHITE);
+    }
+
+    draw_header("SCAN HISTORY");
+}
+
 static void render_capture_menu() {
     auto& d = HW::oled;
     d.clearDisplay();
 
-    // Card 0: Standard Capture (y = 18..35)
-    const bool sel0 = (g_capture_menu_idx == 0);
-    if (sel0) {
-        d.fillRoundRect(2, 18, 124, 18, 2, SSD1306_WHITE);
-        d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    } else {
-        d.drawRoundRect(2, 18, 124, 18, 2, SSD1306_WHITE);
-        d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    }
-    d.setCursor(6, 21);
-    d.print(sel0 ? "> STANDARD CAP" : "  STANDARD CAP");
-    d.setCursor(6, 29);
-    d.print("  Fast / 1-Frame");
+    // Card 0: Standard (y=17..28)
+    const bool s0 = (g_capture_menu_idx == 0);
+    if (s0) { d.fillRoundRect(2, 17, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_BLACK, SSD1306_WHITE); }
+    else    { d.drawRoundRect(2, 17, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_WHITE, SSD1306_BLACK); }
+    d.setCursor(6, 19); d.print(s0 ? "> STANDARD CAP" : "  STANDARD CAP");
 
-    // Card 1: Advanced Capture (y = 38..55)
-    const bool sel1 = (g_capture_menu_idx == 1);
-    if (sel1) {
-        d.fillRoundRect(2, 38, 124, 18, 2, SSD1306_WHITE);
-        d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    } else {
-        d.drawRoundRect(2, 38, 124, 18, 2, SSD1306_WHITE);
-        d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    }
-    d.setCursor(6, 41);
-    d.print(sel1 ? "> ADVANCED CAP" : "  ADVANCED CAP");
-    d.setCursor(6, 49);
-    d.print("  Hold Remote / Deep");
+    // Card 1: Advanced (y=31..42)
+    const bool s1 = (g_capture_menu_idx == 1);
+    if (s1) { d.fillRoundRect(2, 31, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_BLACK, SSD1306_WHITE); }
+    else    { d.drawRoundRect(2, 31, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_WHITE, SSD1306_BLACK); }
+    d.setCursor(6, 33); d.print(s1 ? "> ADVANCED CAP" : "  ADVANCED CAP");
 
-    // Footer hint (y = 57)
+    // Card 2: Raw (y=45..56)
+    const bool s2 = (g_capture_menu_idx == 2);
+    if (s2) { d.fillRoundRect(2, 45, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_BLACK, SSD1306_WHITE); }
+    else    { d.drawRoundRect(2, 45, 124, 12, 2, SSD1306_WHITE);
+              d.setTextColor(SSD1306_WHITE, SSD1306_BLACK); }
+    d.setCursor(6, 47); d.print(s2 ? "> LISTEN RAW" : "  LISTEN RAW");
+
     d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    d.setCursor(4, 57);
-    d.print("R:TOGGLE MID:OK L:BACK");
+    d.setCursor(4, 58);
+    d.print("L/R:SEL  M:OK  L-L:BACK");
 
-
-    // Header vàng đè lên trên cùng
     draw_header("CAPTURE MODE");
 }
 
@@ -581,16 +909,13 @@ static void render_capture_done() {
 
     draw_header("CAPTURED");
 }
-
-// ---------------------------------------------------------------------------
-// ★ CODE LIBRARY — render danh sách (item 0 là [+ ADD NEW CODE])
-// ---------------------------------------------------------------------------
 static void render_saved_list() {
     auto& d = HW::oled;
     d.clearDisplay();
-    const int n = Storage::count();
-    const int total = n + 1; // 0 = [+ ADD NEW CODE], 1..n = saved codes
-    const int visible = 5;
+    const int proto_count = Storage::count();
+    const int raw_count   = Storage::raw_count();
+    const int total       = 1 + proto_count + raw_count;  // +1 = ADD
+    const int visible     = 5;
 
     float target = (float)(g_saved_idx - (visible - 1));
     if (target < 0.0f) target = 0.0f;
@@ -602,23 +927,32 @@ static void render_saved_list() {
     d.setTextSize(1);
     for (int i = 0; i < total; ++i) {
         const int y = (int)lroundf(18.0f + ((float)i - g_saved_scroll) * 9.0f);
-        if (y < 16 || y > 62) continue; // ★ Clip không cho tràn vào header vàng
+        if (y < 16 || y > 62) continue;
 
         const bool sel = (i == g_saved_idx);
         if (sel) d.fillRoundRect(1, y, 126, 8, 2, SSD1306_WHITE);
         d.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE,
                        sel ? SSD1306_WHITE : SSD1306_BLACK);
-        d.setCursor(4, y); d.print(sel ? ">" : " ");
+        d.setCursor(3, y); d.print(sel ? ">" : " ");
 
         if (i == 0) {
             d.setCursor(13, y);
             d.print("[+] ADD NEW CODE");
-        } else {
+        } else if (i - 1 < proto_count) {
             SavedCode c;
             if (Storage::get(i - 1, c)) {
                 char line[24];
-                snprintf(line, sizeof(line), "%02d %-7.7s %6.2fM",
-                         i, c.name, c.freq_khz / 1000.0f);
+                snprintf(line, sizeof(line), "[P] %-6.6s %.2fM",
+                         c.name, c.freq_khz / 1000.0f);
+                d.setCursor(13, y); d.print(line);
+            }
+        } else {
+            int raw_idx = i - 1 - proto_count;
+            SavedCode c;
+            if (Storage::get_raw(raw_idx, c, nullptr, nullptr, 0, nullptr)) {
+                char line[24];
+                snprintf(line, sizeof(line), "[R] %-6.6s %.2fM",
+                         c.name, c.freq_khz / 1000.0f);
                 d.setCursor(13, y); d.print(line);
             }
         }
@@ -649,37 +983,57 @@ static void render_saved_delete_confirm() {
 
     draw_header("DELETE CODE");
 }
-
 static void render_saved_detail() {
-    if (g_delete_confirm) {
-        render_saved_delete_confirm();
-        return;
-    }
+    if (g_delete_confirm) { render_saved_delete_confirm(); return; }
+
     auto& d = HW::oled;
     d.clearDisplay();
-    SavedCode c;
-    int idx = (g_saved_idx > 0) ? (g_saved_idx - 1) : 0;
-    if (!Storage::get(idx, c)) { draw_header("CODE DETAIL"); return; }
-
     d.setTextSize(1);
-    d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+
+    const int proto_count  = Storage::count();
+    const int combined_idx = g_saved_idx - 1;
+
+    SavedCode c;
+    bool is_raw = false;
+
+    if (combined_idx < proto_count) {
+        if (!Storage::get(combined_idx, c)) { draw_header("CODE DETAIL"); return; }
+    } else {
+        int raw_idx = combined_idx - proto_count;
+        if (!Storage::get_raw(raw_idx, c, nullptr, nullptr, 0, nullptr)) {
+            draw_header("CODE DETAIL"); return;
+        }
+        is_raw = true;
+    }
+
     char buf[32];
-    snprintf(buf, sizeof(buf), "NAME: %.12s", c.name);
+
+    // Line 1: name + badge
+    snprintf(buf, sizeof(buf), "[%s] %.9s",
+             is_raw ? "R" : "P", c.name);
     d.setCursor(3, 18); d.print(buf);
 
-    snprintf(buf, sizeof(buf), "0x%llX", (unsigned long long)c.payload);
-    d.setCursor(3, 27); d.print(buf);
+    if (is_raw) {
+        // Raw info
+        snprintf(buf, sizeof(buf), "%u edges", c.raw_count);
+        d.setCursor(3, 27); d.print(buf);
+        snprintf(buf, sizeof(buf), "F %.3fM  R%u",
+                 c.freq_khz / 1000.0f, c.repeats);
+        d.setCursor(3, 36); d.print(buf);
+        d.setCursor(3, 45); d.print("RAW waveform");
+    } else {
+        // Proto info
+        snprintf(buf, sizeof(buf), "0x%llX", (unsigned long long)c.payload);
+        d.setCursor(3, 27); d.print(buf);
+        snprintf(buf, sizeof(buf), "%ub %uus %s",
+                 c.bits, c.T_us, c.inverted ? "INV" : "NRM");
+        d.setCursor(3, 36); d.print(buf);
+        snprintf(buf, sizeof(buf), "F %.3fM R%u",
+                 c.freq_khz / 1000.0f, c.repeats);
+        d.setCursor(3, 45); d.print(buf);
+    }
 
-    snprintf(buf, sizeof(buf), "%ub  %uus  %s",
-             c.bits, c.T_us, c.inverted ? "INV" : "NORM");
-    d.setCursor(3, 36); d.print(buf);
-
-    snprintf(buf, sizeof(buf), "FREQ: %.3fM  R%u",
-             c.freq_khz / 1000.0f, c.repeats);
-    d.setCursor(3, 45); d.print(buf);
-
-    // 4 Action Buttons ở đáy màn hình (y = 54..62):
-    // TX, JAM, REN, DEL
+    // Action buttons
     const char* actions[4] = {"TX", "JAM", "REN", "DEL"};
     const int bx[4] = {3, 33, 63, 95};
     const int bw[4] = {27, 27, 29, 30};
@@ -703,46 +1057,82 @@ static void render_saved_detail() {
 }
 
 // ===========================================================================
-// ★ MULTI-BUTTON 4-BIT REMOTE HELPERS & RENDER
+// ★ MULTI-BUTTON 8-BIT REMOTE HELPERS & RENDER
 // ===========================================================================
+static const uint8_t BTN_CMDS[8] = {
+    0x01, // Button 1 (0001)
+    0x02, // Button 2 (0010)
+    0x04, // Button 3 (0100)
+    0x08, // Button 4 (1000)
+    0x03, // Button 5 (0011)
+    0x05, // Button 6 (0101)
+    0x06, // Button 7 (0110)
+    0x0C  // Button 8 (1100)
+};
+
 static int detect_root_button(uint8_t cmd) {
-    if (cmd == 0x01) return 1;
-    if (cmd == 0x02) return 2;
-    if (cmd == 0x04) return 3;
-    if (cmd == 0x08) return 4;
-    // Fallback nếu có nhiều bit hoặc không chuẩn
+    for (int i = 0; i < 8; ++i) {
+        if (BTN_CMDS[i] == cmd) return i + 1;
+    }
     if (cmd & 0x01) return 1;
     if (cmd & 0x02) return 2;
     if (cmd & 0x04) return 3;
     if (cmd & 0x08) return 4;
     return 1;
 }
-
-static void generate_remote_buttons(const SavedCode& c, int count) {
-    g_remote_btn_count = (count < 1) ? 1 : ((count > 4) ? 4 : count);
+// ★ v3.6: Lọc noise nền trước khi ghi history
+// Nhiễu nền 300–310 MHz, có RSSI yếu (-70..-60), hoặc nằm ngoài band remote
+// thật → KHÔNG ghi vào history. History chỉ ghi tín hiệu thật.
+static bool freq_is_real_remote_band(float f) {
+    // 315 MHz band (châu Âu / Á / VN)
+    if (f >= 313.0f && f <= 317.0f) return true;
+    // 433 MHz band (toàn cầu) — phổ biến nhất
+    if (f >= 430.0f && f <= 440.0f) return true;
+    // 868 MHz band (EU)
+    if (f >= 866.0f && f <= 870.0f) return true;
+    // 915 MHz band (Mỹ)
+    if (f >= 913.0f && f <= 917.0f) return true;
+    // Ngoài các band trên = noise (đặc biệt 300–310 MHz)
+    return false;
+}
+static void generate_8_buttons(const SavedCode& c) {
+    g_remote_btn_count = 8;
     uint64_t base_payload = c.payload & ~((uint64_t)0x0F);
-    static const uint8_t BTN_CMDS[4] = { 0x01, 0x02, 0x04, 0x08 };
+    uint8_t cmd = (uint8_t)(c.payload & 0x0F);
+    g_remote_root_cmd = cmd;
+    g_remote_root_btn = detect_root_button(cmd);
 
-    for (int i = 0; i < g_remote_btn_count; ++i) {
+    for (int i = 0; i < 8; ++i) {
         int btn_num = i + 1;
         bool is_root = (btn_num == g_remote_root_btn);
         g_remote_btns[i].is_root = is_root;
         g_remote_btns[i].cmd     = BTN_CMDS[i];
+        g_remote_btns[i].saved_to_lib = is_root;
 
         if (is_root) {
             g_remote_btns[i].payload = c.payload;
             snprintf(g_remote_btns[i].label, sizeof(g_remote_btns[i].label),
-                     "(*) button %d", btn_num);
+                     "(*) Button %d", btn_num);
+            strncpy(g_remote_btns[i].name, c.name, sizeof(g_remote_btns[i].name) - 1);
         } else {
             g_remote_btns[i].payload = base_payload | BTN_CMDS[i];
             snprintf(g_remote_btns[i].label, sizeof(g_remote_btns[i].label),
-                     "button %d", btn_num);
+                     "Button %d", btn_num);
+            // Tên ngẫu nhiên mặc định cho mỗi nút
+            uint16_t rnd_val = (uint16_t)((micros() ^ (i * 0x3D71) ^ rand()) & 0xFFFF);
+            snprintf(g_remote_btns[i].name, sizeof(g_remote_btns[i].name),
+                     "RND_%04X", rnd_val);
         }
+        g_remote_btns[i].name[sizeof(g_remote_btns[i].name) - 1] = 0;
     }
 }
 
+static void generate_remote_buttons(const SavedCode& c, int /*count*/) {
+    generate_8_buttons(c);
+}
+
 // ---------------------------------------------------------------------------
-// 1. Menu chọn chế độ (1: Phân tích 4-bit Remote, 2: Code Detail gốc)
+// 1. Menu chọn chế độ (1: Auto 8-Button, 2: Code Detail gốc)
 // ---------------------------------------------------------------------------
 static void render_saved_mode_select() {
     auto& d = HW::oled;
@@ -754,7 +1144,6 @@ static void render_saved_mode_select() {
     d.setTextSize(1);
     char buf[32];
 
-    // Dòng tóm tắt thông tin mã (y = 17..33)
     snprintf(buf, sizeof(buf), "[%02d] %.8s  %.2fM", g_saved_idx, c.name, c.freq_khz / 1000.0f);
     d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
     d.setCursor(3, 17); d.print(buf);
@@ -764,7 +1153,7 @@ static void render_saved_mode_select() {
 
     d.drawFastHLine(2, 35, 124, SSD1306_WHITE);
 
-    // Card 0: Mục 1 - 4-BIT REMOTE (y = 37..48)
+    // Card 0: Mục 1 - AUTO 8-BUTTON (y = 37..48)
     bool sel0 = (g_saved_mode_idx == 0);
     if (sel0) {
         d.fillRoundRect(2, 37, 124, 12, 2, SSD1306_WHITE);
@@ -774,7 +1163,7 @@ static void render_saved_mode_select() {
         d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
     }
     d.setCursor(6, 39);
-    d.print(sel0 ? "> 1. REMOTE 4-BIT" : "  1. REMOTE 4-BIT");
+    d.print(sel0 ? "> 1. AUTO 8-BUTTON" : "  1. AUTO 8-BUTTON");
 
     // Card 1: Mục 2 - CODE DETAIL (y = 51..62)
     bool sel1 = (g_saved_mode_idx == 1);
@@ -795,75 +1184,43 @@ static void render_saved_mode_select() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Màn hình chọn số nút (e.g. 2, 3, 4 nút)
+// 2. Màn hình chọn số nút (backward compat)
 // ---------------------------------------------------------------------------
 static void render_saved_btn_count() {
-    auto& d = HW::oled;
-    d.clearDisplay();
-    int idx = (g_saved_idx > 0) ? (g_saved_idx - 1) : 0;
-    SavedCode c;
-    if (!Storage::get(idx, c)) { draw_header("BUTTON COUNT"); return; }
-
-    d.setTextSize(1);
-    char buf[32];
-
-    // Hộp hiển thị kết quả phân tích 4-bit (y = 17..35)
-    d.drawRoundRect(2, 17, 124, 19, 2, SSD1306_WHITE);
-    d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-
-    // Chuỗi binary 4 bit
-    char bin[5];
-    for (int b = 3; b >= 0; --b) bin[3 - b] = (g_remote_root_cmd & (1 << b)) ? '1' : '0';
-    bin[4] = 0;
-
-    snprintf(buf, sizeof(buf), "CMD: 0x%X (%sb)", g_remote_root_cmd, bin);
-    d.setCursor(6, 20); d.print(buf);
-
-    snprintf(buf, sizeof(buf), "BASE: (*) BUTTON %d", g_remote_root_btn);
-    d.setCursor(6, 27); d.print(buf);
-
-    // Hộp chọn số nút (y = 38..50)
-    d.fillRoundRect(14, 38, 100, 13, 2, SSD1306_WHITE);
-    d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    d.setCursor(18, 41); d.print("<");
-    d.setCursor(104, 41); d.print(">");
-
-    snprintf(buf, sizeof(buf), "%d BUTTONS", g_btn_count);
-    int text_len = (int)strlen(buf) * 6;
-    int tx = 14 + (100 - text_len) / 2;
-    d.setCursor(tx, 41); d.print(buf);
-
-    // Hướng dẫn chân trang (y = 54)
-    d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    d.setCursor(8, 54); d.print("MID=OK   HOLD M=BACK");
-
-    draw_header("BUTTON COUNT");
+    render_saved_mode_select();
 }
 
 // ---------------------------------------------------------------------------
-// 3. Màn hình danh sách button sẵn sàng phát (bấm MID phát 15 lần, giữ MID back)
+// 3. Màn hình danh sách 8 nút (Auto 8-Button)
 // ---------------------------------------------------------------------------
 static void render_saved_btn_tx() {
     auto& d = HW::oled;
     d.clearDisplay();
     int idx = (g_saved_idx > 0) ? (g_saved_idx - 1) : 0;
     SavedCode c;
-    if (!Storage::get(idx, c)) { draw_header("REMOTE TX"); return; }
+    if (!Storage::get(idx, c)) { draw_header("AUTO 8-BTN"); return; }
 
     d.setTextSize(1);
 
-    // Vẽ danh sách các nút
-    int count = g_remote_btn_count;
-    int row_h = (count <= 3) ? 10 : 9;
-    int start_y = (count == 2) ? 20 : ((count == 3) ? 18 : 17);
-    int step_y  = (count == 2) ? 14 : ((count == 3) ? 11 : 9);
+    // Hiển thị window 4 nút cuộn
+    int start = 0;
+    if (g_remote_btn_idx >= 3) {
+        start = g_remote_btn_idx - 2;
+        if (start > 4) start = 4;
+    }
 
-    for (int i = 0; i < count; ++i) {
+    const int row_h = 9;
+    const int start_y = 17;
+    const int step_y = 9;
+
+    for (int i = 0; i < 4; ++i) {
+        int btn_i = start + i;
+        if (btn_i >= 8) break;
         int y = start_y + i * step_y;
-        bool sel = (i == g_remote_btn_idx);
+        bool sel = (btn_i == g_remote_btn_idx);
 
         if (sel) {
-            d.fillRoundRect(2, y, 124, row_h, 2, SSD1306_WHITE);
+            d.fillRoundRect(2, y, 120, row_h, 2, SSD1306_WHITE);
             d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
             d.setCursor(4, y + 1); d.print(">");
         } else {
@@ -872,21 +1229,74 @@ static void render_saved_btn_tx() {
         }
 
         d.setCursor(12, y + 1);
-        d.print(g_remote_btns[i].label);
+        d.print(g_remote_btns[btn_i].label);
 
-        // Hiển thị mã command [0x1], [0x2], [0x4], [0x8] bên phải
+        // Hiển thị command [0xX]
         char cmd_str[8];
-        snprintf(cmd_str, sizeof(cmd_str), "[0x%X]", g_remote_btns[i].cmd);
-        d.setCursor(94, y + 1);
+        snprintf(cmd_str, sizeof(cmd_str), "[0x%X]", g_remote_btns[btn_i].cmd);
+        d.setCursor(88, y + 1);
         d.print(cmd_str);
     }
 
-    // Vùng chân trang: Hiển thị trạng thái phát và Payload
+    // Scrollbar bên phải
+    d.drawFastVLine(125, 17, 35, SSD1306_WHITE);
+    int thumb_y = 17 + (g_remote_btn_idx * (35 - 7)) / 7;
+    d.fillRect(124, thumb_y, 3, 7, SSD1306_WHITE);
+
+    // Chân trang: Payload + MID:DETAIL
     d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
     d.drawFastHLine(2, 53, 124, SSD1306_WHITE);
 
-    if (millis() - g_btn_tx_ms < 900) {
-        // Vừa mới phát xong: hiển thị banner nổi bật
+    char pbuf[24];
+    snprintf(pbuf, sizeof(pbuf), "0x%llX",
+             (unsigned long long)g_remote_btns[g_remote_btn_idx].payload);
+    d.setCursor(3, 55);
+    d.print(pbuf);
+
+    d.drawRoundRect(66, 54, 59, 9, 2, SSD1306_WHITE);
+    d.setCursor(69, 55);
+    d.print("MID:DETAIL");
+
+    char hdr[20];
+    snprintf(hdr, sizeof(hdr), "AUTO BTN (%d/8)", g_remote_btn_idx + 1);
+    draw_header(hdr);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Detail menu cho nút auto được chọn (TX, JAM, REN - không có DEL)
+// ---------------------------------------------------------------------------
+static void render_auto_btn_detail() {
+    auto& d = HW::oled;
+    d.clearDisplay();
+    int idx = (g_saved_idx > 0) ? (g_saved_idx - 1) : 0;
+    SavedCode c;
+    if (!Storage::get(idx, c)) { draw_header("BTN DETAIL"); return; }
+
+    RemoteBtn& btn = g_remote_btns[g_remote_btn_idx];
+
+    d.setTextSize(1);
+    d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "NAME: %.12s", btn.name);
+    d.setCursor(3, 18); d.print(buf);
+
+    snprintf(buf, sizeof(buf), "0x%llX  [0x%X]",
+             (unsigned long long)btn.payload, btn.cmd);
+    d.setCursor(3, 27); d.print(buf);
+
+    snprintf(buf, sizeof(buf), "%ub  %uus  %s",
+             c.bits, c.T_us, c.inverted ? "INV" : "NORM");
+    d.setCursor(3, 36); d.print(buf);
+
+    snprintf(buf, sizeof(buf), "FREQ: %.3fM  R%u",
+             c.freq_khz / 1000.0f, c.repeats ? c.repeats : 15);
+    d.setCursor(3, 45); d.print(buf);
+
+    if (millis() - g_btn_save_notify_ms < 1200) {
+        d.fillRoundRect(2, 54, 124, 9, 2, SSD1306_WHITE);
+        d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+        d.setCursor(14, 55); d.print(">>> SAVED TO LIB! <<<");
+    } else if (millis() - g_btn_tx_ms < 900) {
         d.fillRoundRect(2, 54, 124, 9, 2, SSD1306_WHITE);
         d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
         if (g_btn_tx_ok) {
@@ -895,37 +1305,199 @@ static void render_saved_btn_tx() {
             d.setCursor(14, 55); d.print("! TX ERROR (15x) !");
         }
     } else {
-        // Trạng thái sẵn sàng
-        char pbuf[24];
-        snprintf(pbuf, sizeof(pbuf), "0x%llX",
-                 (unsigned long long)g_remote_btns[g_remote_btn_idx].payload);
-        d.setCursor(3, 55);
-        d.print(pbuf);
+        const char* actions[3] = {"TX", "JAM", "REN"};
+        const int bx[3] = {6, 48, 90};
+        const int bw[3] = {32, 32, 32};
 
-        d.drawRoundRect(74, 54, 51, 9, 2, SSD1306_WHITE);
-        d.setCursor(77, 55);
-        d.print("READY 15x");
+        for (int i = 0; i < 3; ++i) {
+            bool sel = (g_auto_btn_action == i);
+            if (sel) {
+                d.fillRoundRect(bx[i], 54, bw[i], 9, 2, SSD1306_WHITE);
+                d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+            } else {
+                d.drawRoundRect(bx[i], 54, bw[i], 9, 2, SSD1306_WHITE);
+                d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+            }
+            int lx = bx[i] + (bw[i] - (int)strlen(actions[i]) * 6) / 2;
+            d.setCursor(lx, 55);
+            d.print(actions[i]);
+        }
     }
 
-    char hdr[16];
-    snprintf(hdr, sizeof(hdr), "%.8s REMOTE", c.name);
+    char hdr[20];
+    snprintf(hdr, sizeof(hdr), "BTN %d DETAIL", g_remote_btn_idx + 1);
     draw_header(hdr);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Màn hình chọn Jammer Mode (Jamming vs Jam Delay)
+// ---------------------------------------------------------------------------
+static void render_jam_mode_select() {
+    auto& d = HW::oled;
+    d.clearDisplay();
+    d.setTextSize(1);
+    char buf[32];
+
+    snprintf(buf, sizeof(buf), "CODE: %.10s", g_play.name);
+    d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    d.setCursor(3, 17); d.print(buf);
+
+    snprintf(buf, sizeof(buf), "0x%llX  %.2fM",
+             (unsigned long long)g_play.payload, g_play.freq_khz / 1000.0f);
+    d.setCursor(3, 26); d.print(buf);
+
+    d.drawFastHLine(2, 35, 124, SSD1306_WHITE);
+
+    // Card 0: Jamming (Continuous)
+    bool sel0 = (g_jam_mode_sel == 0);
+    if (sel0) {
+        d.fillRoundRect(2, 37, 124, 12, 2, SSD1306_WHITE);
+        d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    } else {
+        d.drawRoundRect(2, 37, 124, 12, 2, SSD1306_WHITE);
+        d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    }
+    d.setCursor(6, 39);
+    d.print(sel0 ? "> 1. JAMMING (CONT)" : "  1. JAMMING (CONT)");
+
+    // Card 1: Jam Delay
+    bool sel1 = (g_jam_mode_sel == 1);
+    if (sel1) {
+        d.fillRoundRect(2, 51, 124, 12, 2, SSD1306_WHITE);
+        d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    } else {
+        d.drawRoundRect(2, 51, 124, 12, 2, SSD1306_WHITE);
+        d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    }
+    d.setCursor(6, 53);
+    d.print(sel1 ? "> 2. JAM DELAY" : "  2. JAM DELAY");
+
+    draw_header("JAMMER MODE");
+}
+
+// ---------------------------------------------------------------------------
+// 6. Màn hình chọn tốc độ Jam Delay (Low / Medium / High)
+// ---------------------------------------------------------------------------
+static void render_jam_delay_speed() {
+    auto& d = HW::oled;
+    d.clearDisplay();
+    d.setTextSize(1);
+
+    const char* speeds[3] = {
+        "1. LOW   (1.0s / 15x)",
+        "2. MEDIUM(0.5s / 15x)",
+        "3. HIGH  (250ms/ 15x)"
+    };
+
+    d.setCursor(3, 17);
+    d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    d.print("SELECT INTERVAL:");
+
+    for (int i = 0; i < 3; ++i) {
+        int y = 27 + i * 11;
+        bool sel = (g_jam_speed_idx == i);
+        if (sel) {
+            d.fillRoundRect(2, y, 124, 10, 2, SSD1306_WHITE);
+            d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+            d.setCursor(4, y + 1); d.print(">");
+        } else {
+            d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+            d.setCursor(4, y + 1); d.print(" ");
+        }
+        d.setCursor(14, y + 1);
+        d.print(speeds[i]);
+    }
+
+    d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    d.setCursor(8, 61 - 3);
+    d.print("L/R:SEL M:GO M-HOLD:BACK");
+
+    draw_header("JAM DELAY SPEED");
+}
+
+// ---------------------------------------------------------------------------
+// 7. Màn hình Jammer Running (Continuous & Jam Delay)
+// ---------------------------------------------------------------------------
+static void render_jam_running() {
+    auto& d = HW::oled;
+    d.clearDisplay();
+    d.setTextSize(1);
+    char buf[32];
+
+    d.drawRoundRect(2, 17, 124, 34, 2, SSD1306_WHITE);
+
+    snprintf(buf, sizeof(buf), "0x%llX  %.2fM",
+             (unsigned long long)g_play.payload, g_play.freq_khz / 1000.0f);
+    d.setCursor(6, 21); d.print(buf);
+
+    if (g_jam_mode == JAM_MODE_CONT) {
+        snprintf(buf, sizeof(buf), "SENT: %lu pkts", (unsigned long)g_jam_total_pkts);
+        d.setCursor(6, 31); d.print(buf);
+
+        d.setCursor(6, 40);
+        d.print("MODE: CONTINUOUS TX");
+        draw_header("JAMMING CONT");
+    } else {
+        snprintf(buf, sizeof(buf), "BURST: %lu (%lux)",
+                 (unsigned long)g_jam_burst_count,
+                 (unsigned long)g_jam_total_pkts);
+        d.setCursor(6, 30); d.print(buf);
+
+        d.setCursor(6, 39);
+        if (g_jam_is_bursting) {
+            d.print("STATUS: >> FIRING 15x <<");
+        } else {
+            uint32_t now = millis();
+            uint32_t elapsed = (now >= g_jam_last_burst_ms) ? (now - g_jam_last_burst_ms) : 0;
+            uint32_t remain = (elapsed < g_jam_delay_interval_ms) ? (g_jam_delay_interval_ms - elapsed) : 0;
+            snprintf(buf, sizeof(buf), "NEXT IN: ~%lu ms", (unsigned long)remain);
+            d.print(buf);
+        }
+
+        const char* spd_str = (g_jam_speed_idx == 0) ? "LOW" : ((g_jam_speed_idx == 1) ? "MED" : "HIGH");
+        char hdr[20];
+        snprintf(hdr, sizeof(hdr), "JAM DELAY [%s]", spd_str);
+        draw_header(hdr);
+    }
+
+    // Nút dừng ở chân trang
+    d.fillRoundRect(2, 53, 124, 10, 2, SSD1306_WHITE);
+    d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    d.setCursor(18, 54);
+    d.print("[MID] STOP JAMMER");
 }
 
 static void render_replay() {
     auto& d = HW::oled;
     d.clearDisplay();
-    d.setTextSize(1); char buf[32];
-    d.setCursor(3, 19); snprintf(buf, sizeof(buf), "CODE  %.12s", g_play.name); d.print(buf);
-    d.setCursor(3, 30); snprintf(buf, sizeof(buf), "0x%llX", (unsigned long long)g_play.payload); d.print(buf);
-    d.setCursor(3, 40); snprintf(buf, sizeof(buf), "BITS %u  T %u us", g_play.bits, g_play.T_us); d.print(buf);
-    d.setCursor(3, 50);
-    snprintf(buf, sizeof(buf), "FREQ %.3fM", g_play.freq_khz / 1000.0f);
-    d.print(buf);
-    d.drawRoundRect(74, 47, 51, 14, 3, SSD1306_WHITE);
-    d.setCursor(87, 51); d.print("READY");
+    d.setTextSize(1);
+    char buf[32];
 
-    draw_header("RELAY READY");
+    d.setCursor(3, 18);
+    snprintf(buf, sizeof(buf), "CODE  %.12s", g_play.name);
+    d.print(buf);
+
+    d.setCursor(3, 28);
+    snprintf(buf, sizeof(buf), "0x%llX", (unsigned long long)g_play.payload);
+    d.print(buf);
+
+    d.setCursor(3, 38);
+    snprintf(buf, sizeof(buf), "BITS %u  T %u us", g_play.bits, g_play.T_us);
+    d.print(buf);
+
+    d.setCursor(3, 48);
+    snprintf(buf, sizeof(buf), "FREQ %.3fM x%u",
+             g_play.freq_khz / 1000.0f, g_play.repeats);
+    d.print(buf);
+
+    // ★ Hint bar thay cho badge "READY" tĩnh
+    d.fillRoundRect(2, 55, 124, 9, 2, SSD1306_WHITE);
+    d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    d.setCursor(18, 56);
+    d.print("MID=TX   L=BACK");
+    d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+
+    draw_header("REPLAY");
 }
 
 static void render_jammer() {
@@ -943,14 +1515,53 @@ static void render_jammer() {
 static void render_jammer_all() {
     auto& d = HW::oled;
     d.clearDisplay();
-    d.drawRoundRect(6, 21, 116, 30, 4, SSD1306_WHITE);
-    d.setTextSize(2); d.setCursor(25, 27); d.print("RUNNING");
     d.setTextSize(1);
-    const int n = Storage::count();
-    char buf[32];
-    d.setCursor(3, 55); snprintf(buf, sizeof(buf), "ITEM %d / %d", min(g_jam_all_idx + 1, n), n); d.print(buf);
+    char buf[40];
 
-    draw_header("JAM ALL");
+    Jammer::Mode m = Jammer::get_mode();
+    const char* tag = "?";
+switch (m) {
+    case Jammer::MODE_CW_SPOT:   tag = "CW";      break;
+    case Jammer::MODE_HOP_CW:    tag = "HOP";     break;
+    case Jammer::MODE_OOK_NOISE: tag = "OOK";     break;
+    case Jammer::MODE_HOP_OOK:   tag = "HOP OOK"; break;
+    case Jammer::MODE_SPAM:      tag = "SPAM";    break;
+    default: break;
+}
+
+    // Big title
+    d.setTextSize(2);
+    d.setCursor(10, 18);
+    d.print("JAMMING");
+    d.setTextSize(1);
+
+    // Frequency + mode
+    d.setCursor(3, 39);
+    snprintf(buf, sizeof(buf), "%s @ %.3fM", tag, Jammer::get_current_freq());
+    d.print(buf);
+
+    // Hop: CH hiển thị; else PKT
+    d.setCursor(3, 48);
+   if (m == Jammer::MODE_HOP_CW || m == Jammer::MODE_HOP_OOK) {
+        snprintf(buf, sizeof(buf), "CH %d/%d  PKT %lu",
+                 Jammer::get_hop_idx() + 1,
+                 Jammer::get_hop_count(),
+                 (unsigned long)Jammer::get_packets_sent());
+    } else {
+        snprintf(buf, sizeof(buf), "PKT %lu",
+                 (unsigned long)Jammer::get_packets_sent());
+    }
+    d.print(buf);
+
+    // Elapsed + stop hint
+    uint32_t el = Jammer::get_elapsed_ms();
+    d.setCursor(3, 57);
+    snprintf(buf, sizeof(buf), "%lu.%lus  MID=STOP",
+             (unsigned long)(el / 1000),
+             (unsigned long)((el % 1000) / 100));
+    d.print(buf);
+
+    draw_header("RF JAMMER");
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,7 +1750,16 @@ static void update_boot() {
 }
 
 static void update_main() {
-    HW::led_idle();
+    switch (g_main_idx) {
+        case 0: HW::led_set_theme(0, 220, 220); break;   // Live Scan: Cyan
+        case 1: HW::led_set_theme(0, 220, 50); break;    // Signal Capture: Emerald Green
+        case 2: HW::led_set_theme(255, 140, 0); break;   // Code Library: Amber/Gold
+        case 3: HW::led_set_theme(255, 20, 0); break;    // RF Jammer: Fiery Red
+        case 4: HW::led_set_theme(200, 0, 255); break;   // Brute Force: Magenta
+        case 5: HW::led_set_theme(30, 100, 255); break;  // Settings: Ice Blue
+        case 6: HW::led_set_theme(255, 0, 140); break;   // About: Pink
+        default: HW::led_idle(); break;
+    }
     const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
     const HW::Ev eM = HW::get_event(HW::BTN_MID);
     const HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
@@ -1148,16 +1768,10 @@ static void update_main() {
     if (moved) request_render();
     if (eM == HW::EV_CLICK) {
         switch (g_main_idx) {
-            case 0: {   // Scan
+            case 0: {   // Live Scan → chọn Full Range / 433+315 Fast trước
                 rf_listen_end();
-                RFListenerConfig cfg = RF_LISTENER_DEFAULT_CONFIG;
-                cfg.max_bits = Storage::get_max_bits();    // ★ v2
-                cfg.verbose = false; cfg.frequency_mhz = Storage::get_frequency();
-                cfg.agc_sensitive = true;
-                if (!rf_listen_begin(cfg)) { HW::led_error(); break; }
-                rf_listen_set_nonblocking(true);
-                rf_listen_set_mode(RF_LISTEN_SCAN);
-                enter(ST_SCAN); break;
+                g_scan_menu_idx = 0;
+                enter(ST_SCAN_MENU); break;
             }
 case 1: {   // Capture → sub-menu
     rf_listen_end();
@@ -1168,19 +1782,17 @@ case 1: {   // Capture → sub-menu
                 g_saved_idx = (Storage::count() > 0) ? 1 : 0;
                 enter(ST_SAVED_LIST); break;
 
-            case 3: {   // Jam All
-                if (Storage::count() == 0) { HW::led_error(); break; }
-                rf_listen_end();
-                RFReplayConfig cfg = RF_REPLAY_DEFAULT_CONFIG;
-                cfg.verbose = false;
-                cfg.frequency_mhz = Storage::get_frequency();
-                if (!rf_replay_begin(cfg)) { HW::led_error(); break; }
-                rf_replay_clear_buttons();
-                g_jammer_enter_ms = millis();
-                g_jam_all_idx = 0; g_jam_all_last_freq = 0;
-                Serial.println(F("[JAM-ALL] start"));
-                enter(ST_JAMMER_ALL); break;
-            }
+case 3: {   // ★ RF Jammer — submenu
+    rf_listen_end();
+    RFReplayConfig cfg = RF_REPLAY_DEFAULT_CONFIG;
+    cfg.verbose = false;
+    cfg.frequency_mhz = Storage::get_frequency();
+    if (!rf_replay_begin(cfg)) { HW::led_error(); break; }
+    rf_replay_clear_buttons();
+    g_jammer_menu_idx = 0;
+    enter(ST_JAMMER_MENU);
+    break;
+}
             case 4: {   // ★ Brute Force
                 g_bf_proto_idx = 0;
                 enter(ST_BRUCE_MENU); break;
@@ -1194,16 +1806,113 @@ case 1: {   // Capture → sub-menu
     }
 }
 
+// ---------------------------------------------------------------------------
+// ★ v3.1: Live Scan sub-menu update — Full Range / 433+315 MHz Fast
+// ---------------------------------------------------------------------------
+static void update_scan_menu() {
+    HW::led_idle();
+    const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
+    const HW::Ev eM = HW::get_event(HW::BTN_MID);
+    const HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
+
+    if (eL == HW::EV_CLICK || eL == HW::EV_LONG) {
+        enter(ST_MAIN);
+        return;
+    }
+
+    if (eR == HW::EV_CLICK) {
+        g_scan_menu_idx = (g_scan_menu_idx + 1) % SCAN_MENU_COUNT;
+        request_render();
+    }
+
+    if (eM == HW::EV_CLICK) {
+        if (g_scan_menu_idx == 2) {   // History
+            if (g_scan_hist_idx >= g_scan_hist_count)
+                g_scan_hist_idx = (g_scan_hist_count > 0) ? g_scan_hist_count - 1 : 0;
+            enter(ST_SCAN_HISTORY);
+            return;
+        }
+        RFListenerConfig cfg = RF_LISTENER_DEFAULT_CONFIG;
+        cfg.max_bits = Storage::get_max_bits();    // ★ v2
+        cfg.verbose = false; cfg.frequency_mhz = Storage::get_frequency();
+        cfg.agc_sensitive = true;
+        if (!rf_listen_begin(cfg)) { HW::led_error(); return; }
+        rf_listen_set_nonblocking(true);
+        rf_listen_set_scan_band(g_scan_menu_idx == 1 ? RF_SCAN_BAND_FAST
+                                                       : RF_SCAN_BAND_ALL);
+        rf_listen_set_mode(RF_LISTEN_SCAN);
+        scan_hist_reset_latch();        // reset latch chống nhiễu
+        g_scan_hist_session_id++;       // ★ v3.4: đánh dấu phiên mới (KHÔNG xoá history)
+        enter(ST_SCAN);
+    }
+}
+static void update_scan_history() {
+    HW::led_idle();
+    const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
+    const HW::Ev eM = HW::get_event(HW::BTN_MID);
+    const HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
+
+    // LONG = thoát nhanh (giữ nguyên hành vi cũ)
+    if (eL == HW::EV_LONG || eM == HW::EV_LONG) {
+        enter(ST_SCAN_MENU);
+        return;
+    }
+
+    const int total = g_scan_hist_count;
+    if (total == 0) {
+        if (eL == HW::EV_CLICK) enter(ST_SCAN_MENU);
+        return;
+    }
+
+    // ★ v3.5: CLICK LEFT khi đã ở entry đầu tiên = thoát ngay (không spam)
+    if (eL == HW::EV_CLICK && g_scan_hist_idx == 0) {
+        enter(ST_SCAN_MENU);
+        return;
+    }
+
+    // Dùng nav_step_clamped để không wrap vòng tròn
+    bool moved = nav_step_clamped(HW::BTN_LEFT,  eL, -1,
+                                  g_scan_hist_idx, total, g_scan_hist_left_nav);
+    moved = nav_step_clamped(HW::BTN_RIGHT, eR, +1,
+                             g_scan_hist_idx, total, g_scan_hist_right_nav) || moved;
+    if (moved) request_render();
+
+    // MID = chọn tần số này làm freq hiện tại
+    if (eM == HW::EV_CLICK) {
+        float f = g_scan_hist[g_scan_hist_idx].freq_mhz;
+        Storage::set_frequency(f);
+        Serial.printf("[HIST] set freq = %.3f MHz\n", f);
+        HW::led_flash(0, 255, 0, 400);
+        enter(ST_MAIN);
+    }
+}
+
 static void update_scan() {
     HW::led_scan();
     rf_listen_update();
+    // ★ v3.6: chỉ ghi history khi là tín hiệu thật:
+    //  - freq nằm trong band remote thật (313-317, 430-440, 866-870, 913-917)
+    //  - RSSI đủ mạnh (>= -60 dBm) — noise nền thường -75..-62
+    if (rf_listen_scan_hit_pop()) {
+        const float hit_freq = rf_listen_get_last_peak_freq();
+        const int   hit_rssi = rf_listen_get_last_peak_rssi();
+        const bool  is_real  = freq_is_real_remote_band(hit_freq) &&
+                               (hit_rssi >= -60);
+        if (is_real) {
+            scan_hist_on_hit(hit_freq, hit_rssi);
+            Serial.printf("[HIST] +%.3f MHz  %d dBm\n", hit_freq, hit_rssi);
+        } else {
+            Serial.printf("[HIST] skip noise: %.3f MHz @ %d dBm\n",
+                          hit_freq, hit_rssi);
+        }
+    }
     HW::Ev eL = HW::get_event(HW::BTN_LEFT);
     HW::Ev eM = HW::get_event(HW::BTN_MID);
     if (eL == HW::EV_CLICK) { rf_listen_end(); HW::led_idle(); enter(ST_MAIN); return; }
     if (eM == HW::EV_CLICK) {
         float pk = rf_listen_get_last_peak_freq();
         int pr = rf_listen_get_last_peak_rssi();
-        if (pk > 280.0f && pk < 928.0f) {
+        if (rf_listen_last_peak_is_hit() && pk > 280.0f && pk < 928.0f) {
             Storage::set_frequency(pk);
             Serial.printf("[SCAN] set %.3f MHz (RSSI %d)\n", pk, pr);
             rf_listen_end(); HW::led_flash(0,255,0,400);
@@ -1316,7 +2025,7 @@ static void update_capture_done() {
         return;
     }
 
-    // RIGHT: replay trực tiếp không cần lưu
+        // RIGHT: replay trực tiếp không cần lưu
     if (eR == HW::EV_CLICK) {
         if (!g_cap_has) { enter(ST_MAIN); return; }
         g_play.payload   = g_cap_result.payload;
@@ -1325,10 +2034,12 @@ static void update_capture_done() {
         g_play.inverted  = g_cap_result.inverted;
         g_play.freq_khz  = g_cap_result.frequency_mhz_x1000;
         g_play.repeats   = DEFAULT_REPEATS;
+        g_play.mode      = SAVED_MODE_PROTO;   // ★ FIX: không set → có thể dính rác
+        g_play_idx_raw   = -1;                  // ★ FIX
         strncpy(g_play.name, g_cap_result.protocol, MAX_NAME_LEN - 1);
         g_play.name[MAX_NAME_LEN - 1] = 0;
         if (setup_tx_and_bind()) enter(ST_REPLAY);
-        else enter(ST_MAIN);
+        else                     enter(ST_MAIN);
         return;
     }
 }
@@ -1429,7 +2140,6 @@ static void add_code_wizard() {
         Serial.println(F("[ADD CODE] Storage FULL or Error"));
     }
 }
-
 static void update_saved_list() {
     HW::led_idle();
     const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
@@ -1438,55 +2148,63 @@ static void update_saved_list() {
 
     if (eM == HW::EV_LONG || eL == HW::EV_LONG) { enter(ST_MAIN); return; }
 
-    const int total = Storage::count() + 1;
+    const int proto_count = Storage::count();
+    const int raw_count   = Storage::raw_count();
+    const int total       = 1 + proto_count + raw_count;
+
+    if (total <= 1) {
+        if (eM == HW::EV_CLICK) { add_code_wizard(); request_render(); }
+        return;
+    }
+
     bool moved = nav_step(HW::BTN_LEFT,  eL, -1, g_saved_idx, total, g_saved_left_nav);
     moved = nav_step(HW::BTN_RIGHT, eR, +1, g_saved_idx, total, g_saved_right_nav) || moved;
     if (moved) request_render();
 
     if (eM == HW::EV_CLICK) {
         if (g_saved_idx == 0) {
-            // Mục [+ ADD NEW CODE]
             add_code_wizard();
-            HW::led_idle();
             request_render();
             return;
-        } else {
-            // Mở menu 2 mục (1: Phân tích Remote 4-bit, 2: Code Detail)
+        } else if (g_saved_idx - 1 < proto_count) {
+            // Proto code → mode select (8-button or detail)
             g_saved_mode_idx = 0;
             enter(ST_SAVED_MODE_SELECT);
-            return;
+        } else {
+            // Raw code → skip mode select, vào detail trực tiếp
+            g_saved_detail_action = 0;
+            g_delete_confirm = false;
+            enter(ST_SAVED_DETAIL);
         }
     }
 }
-
 static void update_saved_detail() {
     HW::led_idle();
     const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
     const HW::Ev eM = HW::get_event(HW::BTN_MID);
     const HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
 
-    int idx = (g_saved_idx > 0) ? (g_saved_idx - 1) : 0;
-    SavedCode c;
-    if (!Storage::get(idx, c)) {
-        enter(ST_SAVED_LIST);
-        return;
-    }
+    const int proto_count  = Storage::count();
+    const int combined_idx = g_saved_idx - 1;
+    const bool is_raw      = (combined_idx >= proto_count);
 
-    // Nếu đang ở màn hình xác nhận Delete
+    // Delete confirm path
     if (g_delete_confirm) {
         if (eM == HW::EV_CLICK) {
-            // Xác nhận xóa
-            Storage::remove(idx);
+            if (is_raw) {
+                Storage::remove_raw(combined_idx - proto_count);
+            } else {
+                Storage::remove(combined_idx);
+            }
             g_delete_confirm = false;
             HW::led_flash(255, 0, 0, 400);
-            if (g_saved_idx > Storage::count()) {
-                g_saved_idx = Storage::count();
+            if (g_saved_idx > Storage::count() + Storage::raw_count()) {
+                g_saved_idx = Storage::count() + Storage::raw_count();
             }
             enter(ST_SAVED_LIST);
             return;
         }
         if (eL == HW::EV_CLICK || eM == HW::EV_LONG || eL == HW::EV_LONG) {
-            // Hủy xóa
             g_delete_confirm = false;
             request_render();
             return;
@@ -1494,61 +2212,150 @@ static void update_saved_detail() {
         return;
     }
 
-    // Khi không ở màn hình xác nhận xóa:
+    // Long = back
     if (eL == HW::EV_LONG || eM == HW::EV_LONG) {
-        enter(ST_SAVED_MODE_SELECT);
+        enter(ST_SAVED_LIST);
         return;
     }
 
+    // Navigate actions
     if (eL == HW::EV_CLICK) {
         g_saved_detail_action = (g_saved_detail_action + 3) % 4;
         request_render();
         return;
     }
-
     if (eR == HW::EV_CLICK) {
         g_saved_detail_action = (g_saved_detail_action + 1) % 4;
         request_render();
         return;
     }
 
-    if (eM == HW::EV_CLICK) {
-        switch (g_saved_detail_action) {
-            case 0: // TX (Send / Replay)
-                g_play = c;
-                if (setup_tx_and_bind()) enter(ST_REPLAY);
-                else enter(ST_SAVED_LIST);
-                break;
+    if (eM != HW::EV_CLICK) return;
 
-            case 1: // JAMMER
-                g_play = c;
-                if (setup_tx_and_bind()) {
-                    Serial.println(F("[JAMMER] ON"));
-                    g_jammer_enter_ms = millis();
-                    enter(ST_JAMMER);
-                } else {
-                    enter(ST_SAVED_LIST);
+    // =============== RAW actions ===============
+    if (is_raw) {
+        int raw_idx = combined_idx - proto_count;
+        SavedCode c;
+        if (!Storage::get_raw(raw_idx, c, nullptr, nullptr, 0, nullptr)) {
+            enter(ST_SAVED_LIST); return;
+        }
+
+        switch (g_saved_detail_action) {
+            case 0: {  // TX
+                // Setup TX
+                rf_listen_end();
+                RFReplayConfig rc = RF_REPLAY_DEFAULT_CONFIG;
+                rc.verbose = false;
+                rc.frequency_mhz = c.freq_khz / 1000.0f;
+                if (!rf_replay_begin(rc)) { HW::led_error(); return; }
+                rf_replay_set_frequency(rc.frequency_mhz);
+                rf_replay_clear_buttons();
+
+                static uint32_t dur_buf[2048];
+                static uint8_t  lvl_buf[2048];
+                uint16_t n_out = 0;
+                if (Storage::get_raw(raw_idx, c, dur_buf, lvl_buf, 2048, &n_out)) {
+                    bool ok = rf_replay_send_raw_edges(dur_buf, lvl_buf, n_out,
+                                                       c.repeats ? c.repeats : 15);
+                    if (ok) HW::led_tx_ok(); else HW::led_error();
+                    Serial.printf("[TX-RAW] %u edges → %s\n", n_out,
+                                  ok ? "OK" : "FAIL");
                 }
                 break;
+            }
+            case 1: {  // JAM (blocking ~5s spam)
+                rf_listen_end();
+                RFReplayConfig rc = RF_REPLAY_DEFAULT_CONFIG;
+                rc.verbose = false;
+                rc.frequency_mhz = c.freq_khz / 1000.0f;
+                if (!rf_replay_begin(rc)) { HW::led_error(); return; }
+                rf_replay_set_frequency(rc.frequency_mhz);
+                rf_replay_clear_buttons();
 
-            case 2: { // RENAME
+                static uint32_t dur_buf[2048];
+                static uint8_t  lvl_buf[2048];
+                uint16_t n_out = 0;
+                Storage::get_raw(raw_idx, c, dur_buf, lvl_buf, 2048, &n_out);
+
+                auto& d = HW::oled;
+                d.clearDisplay(); d.setTextSize(2);
+                d.setCursor(10, 24); d.print("JAMMING");
+                d.setTextSize(1);
+                d.setCursor(10, 48); d.print("MID to stop");
+                draw_header("JAM RAW");
+                d.display();
+
+                HW::led_jammer();
+                uint32_t t0 = millis();
+                while (millis() - t0 < 5000 && n_out > 0) {
+                    rf_replay_send_raw_edges(dur_buf, lvl_buf, n_out, 1);
+                    HW::buttons_tick();
+                    if (HW::is_pressed(HW::BTN_MID)) break;
+                }
+                while (HW::is_pressed(HW::BTN_MID)) { HW::buttons_tick(); delay(5); }
+                HW::get_event(HW::BTN_LEFT);
+                HW::get_event(HW::BTN_MID);
+                HW::get_event(HW::BTN_RIGHT);
+                HW::led_idle();
+                request_render();
+                break;
+            }
+            case 2: {  // REN
                 char new_name[MAX_NAME_LEN];
-                if (Keyboard::input_text("RENAME CODE", c.name, new_name, MAX_NAME_LEN)) {
-                    strncpy(c.name, new_name, MAX_NAME_LEN - 1);
-                    c.name[MAX_NAME_LEN - 1] = 0;
-                    Storage::update(idx, c);
+                if (Keyboard::input_text("RENAME RAW", c.name, new_name, MAX_NAME_LEN)) {
+                    Storage::rename_raw(raw_idx, new_name);
                     HW::led_flash(0, 255, 0, 300);
+                    Serial.printf("[RAW] rename #%d → '%s'\n", raw_idx, new_name);
                 }
                 HW::led_idle();
                 request_render();
                 break;
             }
-
-            case 3: // DELETE
+            case 3:  // DEL
                 g_delete_confirm = true;
                 request_render();
                 break;
         }
+        return;
+    }
+
+    // =============== PROTO actions ===============
+    SavedCode c;
+    if (!Storage::get(combined_idx, c)) { enter(ST_SAVED_LIST); return; }
+
+    switch (g_saved_detail_action) {
+        case 0:  // TX
+            g_play = c;
+            g_play_idx_raw = -1;
+            if (setup_tx_and_bind()) enter(ST_REPLAY);
+            else enter(ST_SAVED_LIST);
+            break;
+
+        case 1:  // JAM
+            g_play = c;
+            g_play_idx_raw = -1;
+            g_jam_return_state = ST_SAVED_DETAIL;
+            g_jam_mode_sel = 0;
+            enter(ST_JAM_MODE_SELECT);
+            break;
+
+        case 2: {  // REN
+            char new_name[MAX_NAME_LEN];
+            if (Keyboard::input_text("RENAME CODE", c.name, new_name, MAX_NAME_LEN)) {
+                strncpy(c.name, new_name, MAX_NAME_LEN - 1);
+                c.name[MAX_NAME_LEN - 1] = 0;
+                Storage::update(combined_idx, c);
+                HW::led_flash(0, 255, 0, 300);
+            }
+            HW::led_idle();
+            request_render();
+            break;
+        }
+
+        case 3:  // DEL
+            g_delete_confirm = true;
+            request_render();
+            break;
     }
 }
 
@@ -1599,13 +2406,13 @@ static void update_saved_mode_select() {
             enter(ST_SAVED_DETAIL);
             return;
         } else {
-            // Mục 1: Phân tích 4 bit command ở cuối
+            // Mục 1: Auto 8-Button
+            generate_8_buttons(c);
             uint8_t cmd = (uint8_t)(c.payload & 0x0F);
-            g_remote_root_cmd = cmd;
-            g_remote_root_btn = detect_root_button(cmd);
-            // Mặc định: nếu gốc là nút 4 thì chọn 4, còn lại mặc định 3 (theo ví dụ người dùng)
-            g_btn_count = (g_remote_root_btn > 3) ? g_remote_root_btn : 3;
-            enter(ST_SAVED_BTN_COUNT);
+            int root_btn = detect_root_button(cmd);
+            g_remote_btn_idx = (root_btn >= 1 && root_btn <= 8) ? (root_btn - 1) : 0;
+            g_btn_tx_ms = 0;
+            enter(ST_SAVED_BTN_TX);
             return;
         }
     }
@@ -1615,65 +2422,17 @@ static void update_saved_mode_select() {
 // 2. Update chọn số nút
 // ---------------------------------------------------------------------------
 static void update_saved_btn_count() {
-    HW::led_idle();
-    const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
-    const HW::Ev eM = HW::get_event(HW::BTN_MID);
-    const HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
-
     int idx = (g_saved_idx > 0) ? (g_saved_idx - 1) : 0;
     SavedCode c;
-    if (!Storage::get(idx, c)) {
-        enter(ST_SAVED_LIST);
-        return;
-    }
-
-    if (eM == HW::EV_LONG || eL == HW::EV_LONG) {
-        enter(ST_SAVED_MODE_SELECT);
-        return;
-    }
-
-    int min_btn = 2;
-    if (g_remote_root_btn > min_btn) min_btn = g_remote_root_btn;
-    if (min_btn > 4) min_btn = 4;
-
-    if (eL == HW::EV_CLICK) {
-        if (g_btn_count > min_btn) {
-            g_btn_count--;
-            request_render();
-        }
-        return;
-    }
-
-    if (eR == HW::EV_CLICK) {
-        if (g_btn_count < 4) {
-            g_btn_count++;
-            request_render();
-        }
-        return;
-    }
-
-    if (eM == HW::EV_CLICK) {
-        generate_remote_buttons(c, g_btn_count);
-
-        g_play = c;
-        g_play.repeats = 15;
-        if (setup_tx_and_bind()) {
-            g_remote_btn_idx = (g_remote_root_btn >= 1 && g_remote_root_btn <= g_remote_btn_count)
-                               ? (g_remote_root_btn - 1) : 0;
-            g_btn_tx_ms = 0;
-            enter(ST_SAVED_BTN_TX);
-        } else {
-            HW::led_error();
-        }
-        return;
-    }
+    if (Storage::get(idx, c)) generate_8_buttons(c);
+    enter(ST_SAVED_BTN_TX);
 }
 
 // ---------------------------------------------------------------------------
-// 3. Update danh sách button phát tín hiệu
+// 3. Update danh sách 8 nút (Auto 8-Button)
 // ---------------------------------------------------------------------------
 static void update_saved_btn_tx() {
-    HW::led_idle();
+    HW::led_set_theme(0, 220, 150); // Cyan-green
     const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
     const HW::Ev eM = HW::get_event(HW::BTN_MID);
     const HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
@@ -1685,10 +2444,10 @@ static void update_saved_btn_tx() {
         return;
     }
 
-    // Giữ middle để back về (theo yêu cầu)
+    // Giữ middle hoặc left để quay lại
     if (eM == HW::EV_LONG || eL == HW::EV_LONG) {
         rf_replay_clear_buttons();
-        enter(ST_SAVED_BTN_COUNT);
+        enter(ST_SAVED_MODE_SELECT);
         return;
     }
 
@@ -1704,42 +2463,277 @@ static void update_saved_btn_tx() {
         return;
     }
 
-    // Bấm middle: phát 15 lần
+    // Bấm middle: vào menu code detail cho nút đó!
     if (eM == HW::EV_CLICK) {
-        if (!g_play_ok) setup_tx_and_bind();
-        if (g_play_ok) {
-            float play_freq = c.freq_khz / 1000.0f;
-            if (fabsf(rf_replay_get_frequency() - play_freq) > 0.001f) {
-                rf_replay_set_frequency(play_freq);
+        g_auto_btn_action = 0; // default TX
+        enter(ST_AUTO_BTN_DETAIL);
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Update Auto Button Detail (TX, JAM, REN - không có DEL, REN = Save to Lib)
+// ---------------------------------------------------------------------------
+static void update_auto_btn_detail() {
+    HW::led_set_theme(140, 0, 255); // Vivid purple
+    const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
+    const HW::Ev eM = HW::get_event(HW::BTN_MID);
+    const HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
+
+    int idx = (g_saved_idx > 0) ? (g_saved_idx - 1) : 0;
+    SavedCode c;
+    if (!Storage::get(idx, c)) {
+        enter(ST_SAVED_LIST);
+        return;
+    }
+
+    // Long press MID / LEFT để back về danh sách 8 nút
+    if (eL == HW::EV_LONG || eM == HW::EV_LONG) {
+        enter(ST_SAVED_BTN_TX);
+        return;
+    }
+
+    if (eL == HW::EV_CLICK) {
+        g_auto_btn_action = (g_auto_btn_action + 2) % 3;
+        request_render();
+        return;
+    }
+
+    if (eR == HW::EV_CLICK) {
+        g_auto_btn_action = (g_auto_btn_action + 1) % 3;
+        request_render();
+        return;
+    }
+
+    if (eM == HW::EV_CLICK) {
+        RemoteBtn& btn = g_remote_btns[g_remote_btn_idx];
+        switch (g_auto_btn_action) {
+            case 0: { // TX (Bắn 15 lần)
+                g_play = c;
+                g_play.payload = btn.payload;
+                strncpy(g_play.name, btn.name, sizeof(g_play.name) - 1);
+                g_play.name[sizeof(g_play.name) - 1] = 0;
+
+                if (!g_play_ok) setup_tx_and_bind();
+                if (g_play_ok) {
+                    float play_freq = c.freq_khz / 1000.0f;
+                    if (fabsf(rf_replay_get_frequency() - play_freq) > 0.001f) {
+                        rf_replay_set_frequency(play_freq);
+                    }
+
+                    // Hiển thị trạng thái đang phát
+                    auto& d = HW::oled;
+                    d.fillRoundRect(2, 53, 124, 10, 2, SSD1306_WHITE);
+                    d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+                    d.setTextSize(1);
+                    d.setCursor(12, 54);
+                    d.print(">> SENDING 15x <<");
+                    d.display();
+
+                    bool ok = rf_replay_send_raw_code(btn.payload, c.bits, c.T_us, c.inverted, 15);
+                    g_btn_tx_ms = millis();
+                    g_btn_tx_ok = ok;
+
+                    if (ok) HW::led_tx_ok();
+                    else    HW::led_error();
+                    request_render();
+                }
+                break;
             }
 
-            uint64_t tx_payload = g_remote_btns[g_remote_btn_idx].payload;
+            case 1: { // JAMMER
+                g_play = c;
+                g_play.payload = btn.payload;
+                strncpy(g_play.name, btn.name, sizeof(g_play.name) - 1);
+                g_play.name[sizeof(g_play.name) - 1] = 0;
+                g_jam_return_state = ST_AUTO_BTN_DETAIL;
+                g_jam_mode_sel = 0;
+                enter(ST_JAM_MODE_SELECT);
+                break;
+            }
 
-            // Hiển thị trạng thái đang phát ngay lập tức
-            auto& d = HW::oled;
-            d.fillRoundRect(2, 53, 124, 10, 2, SSD1306_WHITE);
-            d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-            d.setTextSize(1);
-            d.setCursor(12, 54);
-            d.print(">> SENDING 15x <<");
-            d.display();
+            case 2: { // REN -> Lưu code vào library luôn!
+                char new_name[MAX_NAME_LEN];
+                if (Keyboard::input_text("SAVE TO LIB", btn.name, new_name, MAX_NAME_LEN)) {
+                    strncpy(btn.name, new_name, MAX_NAME_LEN - 1);
+                    btn.name[MAX_NAME_LEN - 1] = 0;
 
-            uint32_t t0 = micros();
-            bool ok = rf_replay_send_raw_code(tx_payload, c.bits, c.T_us, c.inverted, 15);
-            uint32_t dt = micros() - t0;
+                    SavedCode save_c;
+                    memset(&save_c, 0, sizeof(save_c));
+                    strncpy(save_c.name, new_name, MAX_NAME_LEN - 1);
+                    save_c.name[MAX_NAME_LEN - 1] = 0;
+                    save_c.payload  = btn.payload;
+                    save_c.bits     = c.bits;
+                    save_c.T_us     = c.T_us;
+                    save_c.inverted = c.inverted;
+                    save_c.freq_khz = c.freq_khz;
+                    save_c.repeats  = c.repeats ? c.repeats : 15;
 
-            g_btn_tx_ms = millis();
-            g_btn_tx_ok = ok;
+                    if (Storage::add(save_c)) {
+                        btn.saved_to_lib = true;
+                        g_btn_save_notify_ms = millis();
+                        HW::led_saved();
+                        Serial.printf("[AUTO BTN] Saved '%s' 0x%llX to library!\r\n",
+                                      new_name, (unsigned long long)btn.payload);
+                    } else {
+                        HW::led_error();
+                    }
+                }
+                HW::led_idle();
+                request_render();
+                break;
+            }
+        }
+    }
+}
 
-            Serial.printf("[BTN TX] %s 0x%llX 15x @ %.3fMHz dt=%lu us ok=%d\n",
-                          g_remote_btns[g_remote_btn_idx].label,
-                          (unsigned long long)tx_payload, play_freq,
-                          (unsigned long)dt, ok);
+// ---------------------------------------------------------------------------
+// 5. Update chọn Jammer Mode (Jamming vs Jam Delay)
+// ---------------------------------------------------------------------------
+static void update_jam_mode_select() {
+    HW::led_set_theme(255, 60, 0); // Orange-red
+    const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
+    const HW::Ev eM = HW::get_event(HW::BTN_MID);
+    const HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
 
-            if (ok) HW::led_tx_ok();
-            else    HW::led_error();
-            request_render();
+    if (eL == HW::EV_LONG || eM == HW::EV_LONG) {
+        enter(g_jam_return_state);
+        return;
+    }
+
+    if (eL == HW::EV_CLICK || eR == HW::EV_CLICK) {
+        g_jam_mode_sel = 1 - g_jam_mode_sel;
+        request_render();
+        return;
+    }
+
+    if (eM == HW::EV_CLICK) {
+        if (g_jam_mode_sel == 0) {
+            // Jamming (Continuous)
+            g_jam_mode = JAM_MODE_CONT;
+            g_jammer_enter_ms = millis();
+            g_jam_total_pkts = 0;
+            if (setup_tx_and_bind()) {
+                enter(ST_JAM_RUNNING);
+            } else {
+                HW::led_error();
+                enter(g_jam_return_state);
+            }
+        } else {
+            // Jam Delay -> chọn tốc độ
+            g_jam_speed_idx = 0;
+            enter(ST_JAM_DELAY_SPEED);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Update chọn tốc độ Jam Delay (Low / Medium / High)
+// ---------------------------------------------------------------------------
+static void update_jam_delay_speed() {
+    HW::led_set_theme(255, 100, 0); // Amber
+    const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
+    const HW::Ev eM = HW::get_event(HW::BTN_MID);
+    const HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
+
+    if (eL == HW::EV_LONG || eM == HW::EV_LONG) {
+        enter(ST_JAM_MODE_SELECT);
+        return;
+    }
+
+    if (eL == HW::EV_CLICK) {
+        g_jam_speed_idx = (g_jam_speed_idx + 2) % 3;
+        request_render();
+        return;
+    }
+
+    if (eR == HW::EV_CLICK) {
+        g_jam_speed_idx = (g_jam_speed_idx + 1) % 3;
+        request_render();
+        return;
+    }
+
+    if (eM == HW::EV_CLICK) {
+        g_jam_mode = JAM_MODE_DELAY;
+        if (g_jam_speed_idx == 0)      g_jam_delay_interval_ms = 4000;
+        else if (g_jam_speed_idx == 1) g_jam_delay_interval_ms = 1100;
+        else                           g_jam_delay_interval_ms = 250;
+
+        g_jam_last_burst_ms = 0; // bắn ngay lập tức
+        g_jam_burst_count = 0;
+        g_jam_total_pkts = 0;
+        g_jammer_enter_ms = millis();
+        if (setup_tx_and_bind()) {
+            enter(ST_JAM_RUNNING);
+        } else {
+            HW::led_error();
+            enter(g_jam_return_state);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. Update Jammer Running (Không bị kẹt nút MID!)
+// ---------------------------------------------------------------------------
+static void update_jam_running() {
+    uint32_t now = millis();
+
+    // Chống kẹt nút: Kiểm tra thoát MID / LEFT sau 100ms
+    if (now - g_jammer_enter_ms > 100) {
+        HW::Ev eM = HW::get_event(HW::BTN_MID);
+        HW::Ev eL = HW::get_event(HW::BTN_LEFT);
+        bool mid_down = HW::is_pressed(HW::BTN_MID);
+
+        if (eM != HW::EV_NONE || eL == HW::EV_LONG || ((now - g_jammer_enter_ms > 300) && mid_down)) {
+            // Thoát mượt mà, không kẹt nút
+            uint32_t t_rel = millis();
+            while (HW::is_pressed(HW::BTN_MID) && (millis() - t_rel < 250)) {
+                HW::buttons_tick();
+                delay(5);
+            }
+            HW::get_event(HW::BTN_LEFT);
+            HW::get_event(HW::BTN_MID);
+            HW::get_event(HW::BTN_RIGHT);
+
+            rf_replay_clear_buttons();
+            setup_tx_and_bind();
+            HW::led_idle();
+            enter(g_jam_return_state);
             return;
+        }
+    }
+
+    if (!g_play_ok) return;
+
+    if (g_jam_mode == JAM_MODE_CONT) {
+        // Continuous: bắn 2 gói mỗi chu kỳ để quay lại kiểm tra nút ngay lập tức
+        HW::led_jam_continuous();
+        rf_replay_send_raw_code(g_play.payload, g_play.bits, g_play.T_us, g_play.inverted, 2);
+        g_jam_total_pkts += 2;
+        request_render();
+    } else {
+        // Jam Delay: Low (1.0s), Medium (0.5s), High (250ms)
+        if (g_jam_last_burst_ms == 0 || (now - g_jam_last_burst_ms >= g_jam_delay_interval_ms)) {
+            g_jam_is_bursting = true;
+            HW::led_jam_delay_burst();
+            request_render();
+
+            // Bắn 15 lần, kiểm tra nút giữa các lần bắn để dừng NGAY LẬP TỨC!
+            for (int r = 0; r < 15; r++) {
+                rf_replay_send_raw_code(g_play.payload, g_play.bits, g_play.T_us, g_play.inverted, 1);
+                g_jam_total_pkts++;
+                HW::buttons_tick();
+                if (HW::is_pressed(HW::BTN_MID) || HW::get_event(HW::BTN_MID) != HW::EV_NONE) {
+                    break;
+                }
+            }
+            g_jam_burst_count++;
+            g_jam_last_burst_ms = millis();
+            g_jam_is_bursting = false;
+            request_render();
+        } else {
+            HW::led_jam_delay_wait();
+            request_render();
         }
     }
 }
@@ -1890,76 +2884,335 @@ static void update_replay() {
     HW::Ev eM = HW::get_event(HW::BTN_MID);
     HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
 
+    // ── LEFT = back ────────────────────────────────────────────────
     if (eL == HW::EV_CLICK) {
         rf_replay_clear_buttons();
+        g_play_ok = false;
+        HW::led_idle();
         if (g_saved_idx > 0) enter(ST_SAVED_DETAIL);
-        else enter(ST_SAVED_LIST);
+        else                 enter(ST_SAVED_LIST);
         return;
     }
 
+    // ── MID (hoặc RIGHT) = phát 1 burst ────────────────────────────
+    if (eM == HW::EV_CLICK || eR == HW::EV_CLICK) {
 
-    if (eM == HW::EV_CLICK && g_play_ok) {
-        // ★ Đảm bảo tần số đúng trước mỗi lần phát
-        float play_freq = g_play.freq_khz / 1000.0f;          // ★ v2
-        if (fabsf(rf_replay_get_frequency() - play_freq) > 0.001f) {
-            rf_replay_set_frequency(play_freq);
-            Serial.printf("[TX] freq set → %.3f MHz\n", play_freq);
+        // Self-heal: nếu CC1101 chưa init (lỗi cũ, vào lại), thử init lại
+        if (!g_play_ok) {
+            if (!setup_tx_and_bind()) {
+                HW::led_error();
+                Serial.println(F("[REPLAY] TX not ready"));
+                return;
+            }
         }
 
-        uint32_t t0 = micros();
-        bool ok = rf_replay_send_raw_code(g_play.payload, g_play.bits, g_play.T_us,
-                                          g_play.inverted, g_play.repeats);
-        uint32_t dt = micros() - t0;
-        uint8_t ms1 = rf_replay_get_marcstate();
-        Serial.printf("[TX] ok=%d MARCSTATE=0x%02X dt=%lu us payload=0x%llX bits=%u T=%u inv=%d\n",
-                      ok, ms1, (unsigned long)dt,
-                      (unsigned long long)g_play.payload,
-                      g_play.bits, g_play.T_us, g_play.inverted);
+        // rf_replay_send_raw_code dùng g_cfg.frequency_mhz → phải set đúng
+        float play_freq = g_play.freq_khz / 1000.0f;
+        if (fabsf(rf_replay_get_frequency() - play_freq) > 0.001f) {
+            rf_replay_set_frequency(play_freq);
+        }
+
+        // LED báo hiệu TRƯỚC khi TX (TX blocking ~400ms)
+        HW::led_flash(255, 0, 80, 100);
+
+        bool ok = false;
+
+        if (g_play.mode == SAVED_MODE_RAW && g_play_idx_raw >= 0) {
+            // ── RAW replay ────────────────────────────────────────
+            static uint32_t dur_buf[2048];
+            static uint8_t  lvl_buf[2048];
+            uint16_t n_out = 0;
+            SavedCode tmp;
+            if (Storage::get_raw(g_play_idx_raw, tmp,
+                                 dur_buf, lvl_buf, 2048, &n_out) && n_out > 0) {
+                ok = rf_replay_send_raw_edges(
+                        dur_buf, lvl_buf, n_out,
+                        g_play.repeats ? g_play.repeats : 15);
+            }
+        } else {
+            // ── PROTO replay (nhánh chính) ───────────────────────
+            ok = rf_replay_send_raw_code(
+                    g_play.payload, g_play.bits, g_play.T_us,
+                    g_play.inverted,
+                    g_play.repeats ? g_play.repeats : DEFAULT_REPEATS);
+        }
 
         if (ok) HW::led_tx_ok();
         else    HW::led_error();
+
+        Serial.printf("[REPLAY] %s  0x%llX  %ub  %uus  %s  x%u\n",
+                      ok ? "OK" : "FAIL",
+                      (unsigned long long)g_play.payload,
+                      g_play.bits, g_play.T_us,
+                      g_play.inverted ? "INV" : "NRM",
+                      g_play.repeats);
+
         request_render();
     }
 }
 
 static void update_jammer() {
+    update_jam_running();
+}
+// ==== NEW JAMMER HELPERS (v2) ====
+
+static void start_cw_spot(float freq) {
+    Jammer::Config cfg = {};
+    cfg.mode       = Jammer::MODE_CW_SPOT;
+    cfg.freq_mhz   = freq;
+    cfg.dwell_ms   = 0;
+    if (!Jammer::begin(cfg)) { HW::led_error(); return; }
     HW::led_jammer();
-    if (millis() - g_jammer_enter_ms > 500 && HW::is_pressed(HW::BTN_MID)) {
-        Serial.println(F("[JAMMER] OFF"));
-        while (HW::is_pressed(HW::BTN_MID)) { HW::buttons_tick(); delay(5); }
-        HW::get_event(HW::BTN_LEFT); HW::get_event(HW::BTN_MID); HW::get_event(HW::BTN_RIGHT);
-        HW::led_idle(); setup_tx_and_bind(); enter(ST_REPLAY); return;
+    enter(ST_JAMMER_ALL);
+}
+
+static void start_ook_spot(float freq, bool prompt_first) {
+    if (prompt_first) {
+        float f = freq;
+        if (!Keyboard::input_number("OOK freq (MHz)",
+                                    freq, &f, 0.1f, 280.0f, 928.0f, 3)) {
+            return;
+        }
+        freq = f;
     }
-    if (!g_play_ok) return;
-    static uint32_t last_log = 0;
-    static uint32_t pkt_count = 0;
-    rf_replay_send_raw_code(g_play.payload, g_play.bits, g_play.T_us, g_play.inverted, 5);
-    pkt_count++;
-    if (millis() - last_log > 5000) {
-        last_log = millis();
-        Serial.printf("[JAMMER] sent %lu pkts\n", (unsigned long)pkt_count);
+    Jammer::Config cfg = {};
+    cfg.mode          = Jammer::MODE_OOK_NOISE;
+    cfg.freq_mhz      = freq;
+    cfg.dwell_ms      = 0;
+    cfg.ook_toggle_us = 50;      // 20kHz — proven working
+    cfg.ook_random    = true;    // PRBS noise
+    if (!Jammer::begin(cfg)) { HW::led_error(); return; }
+    HW::led_jammer();
+    enter(ST_JAMMER_ALL);
+}
+
+static void start_hop(const float* list, int count) {
+    Jammer::Config cfg = {};
+    cfg.mode       = Jammer::MODE_HOP_CW;
+    cfg.freq_mhz   = list[0];
+    cfg.hop_list   = list;
+    cfg.hop_count  = count;
+    cfg.dwell_ms   = 80;
+    if (!Jammer::begin(cfg)) { HW::led_error(); return; }
+    HW::led_jammer();
+    enter(ST_JAMMER_ALL);
+}
+
+static void start_spam(float freq) {
+    float f = freq;
+    if (!Keyboard::input_number("Spam freq (MHz)",
+                                freq, &f, 0.1f, 280.0f, 928.0f, 3)) {
+        return;
+    }
+    Jammer::Config cfg = {};
+    cfg.mode             = Jammer::MODE_SPAM;
+    cfg.freq_mhz         = f;
+    cfg.dwell_ms         = 0;
+    cfg.T_us             = 350;
+    cfg.spam_bits        = 24;
+    cfg.spam_inverted    = false;
+    cfg.spam_random      = true;
+    cfg.spam_interval_ms = 45;
+    if (!Jammer::begin(cfg)) { HW::led_error(); return; }
+    HW::led_jammer();
+    enter(ST_JAMMER_ALL);
+}
+
+static void update_jammer_menu() {
+    HW::led_idle();
+    const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
+    const HW::Ev eM = HW::get_event(HW::BTN_MID);
+    const HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
+
+    static NavRepeat lnav, rnav;
+    bool moved = nav_step(HW::BTN_LEFT,  eL, -1, g_jammer_menu_idx,
+                          JAMMER_MENU_COUNT, lnav);
+    moved = nav_step(HW::BTN_RIGHT, eR, +1, g_jammer_menu_idx,
+                     JAMMER_MENU_COUNT, rnav) || moved;
+    if (moved) request_render();
+
+    if (eL == HW::EV_LONG || eM == HW::EV_LONG) {
+        enter(ST_MAIN);
+        return;
+    }
+
+    if (eM == HW::EV_CLICK) {
+        switch (g_jammer_menu_idx) {
+
+            // 0: OOK 315
+            case 0: start_ook_spot(315.000f, false); break;
+
+            // 1: OOK 433
+            case 1: start_ook_spot(433.920f, false); break;
+
+            // 2: ★ OOK Custom — nhập "freq" hoặc "start-stop" qua QWERTY
+            case 2: {
+                char init_buf[40];
+                snprintf(init_buf, sizeof(init_buf), "%.1f",
+                         Storage::get_frequency());
+                char out_buf[40] = {0};
+
+                if (!Keyboard::input_text("f or a-b", init_buf,
+                                          out_buf, sizeof(out_buf))) {
+                    break;
+                }
+
+                // Trim + replace ',' → '.'
+                char* p = out_buf;
+                while (*p == ' ') p++;
+                for (char* q = p; *q; ++q) if (*q == ',') *q = '.';
+
+                if (*p == 0) { HW::led_error(); break; }
+
+                char* dash = strchr(p, '-');
+
+                if (dash) {
+                    // ---- RANGE MODE ----
+                    *dash = 0;
+                    float f1 = atof(p);
+                    float f2 = atof(dash + 1);
+                    if (f1 > f2) { float t = f1; f1 = f2; f2 = t; }
+
+                    if (f1 < 280.0f || f2 > 928.0f || f1 >= f2) {
+                        Serial.printf("[JAM] invalid range %.1f-%.1f\n", f1, f2);
+                        HW::led_error(); break;
+                    }
+
+                    int n = build_range_freqs(f1, f2);
+                    Serial.printf("[JAM] range %.1f-%.1f -> %d freqs\n", f1, f2, n);
+                    if (n < 1) { HW::led_error(); break; }
+
+                    // Ước tính thời gian 1 vòng quét
+                    uint32_t sweep_ms = (uint32_t)n * 60;
+                    Serial.printf("[JAM] sweep time ~%lu ms\n",
+                                  (unsigned long)sweep_ms);
+
+                    Jammer::Config cfg = {};
+                    cfg.mode          = Jammer::MODE_HOP_OOK;
+                    cfg.freq_mhz      = g_range_freqs[0];
+                    cfg.hop_list      = g_range_freqs;
+                    cfg.hop_count     = n;
+                    cfg.dwell_ms      = 60;
+                    cfg.ook_toggle_us = 50;
+                    cfg.ook_random    = true;
+
+                    if (!Jammer::begin(cfg)) { HW::led_error(); break; }
+                } else {
+                    // ---- SINGLE FREQ MODE ----
+                    float f = atof(p);
+                    if (f < 280.0f || f > 928.0f) {
+                        Serial.printf("[JAM] invalid freq %.1f\n", f);
+                        HW::led_error(); break;
+                    }
+                    Jammer::Config cfg = {};
+                    cfg.mode          = Jammer::MODE_OOK_NOISE;
+                    cfg.freq_mhz      = f;
+                    cfg.dwell_ms      = 0;
+                    cfg.ook_toggle_us = 50;
+                    cfg.ook_random    = true;
+                    if (!Jammer::begin(cfg)) { HW::led_error(); break; }
+                }
+                HW::led_jammer();
+                enter(ST_JAMMER_ALL);
+                break;
+            }
+
+            // 3: CW 315
+            case 3: start_cw_spot(315.000f); break;
+
+            // 4: CW 433
+            case 4: start_cw_spot(433.920f); break;
+
+            // 5: Custom CW — QWERTY
+            case 5: {
+                float f = Storage::get_frequency();
+                if (Keyboard::input_float_text("CW freq (MHz)",
+                                               f, &f, 280.0f, 928.0f)) {
+                    start_cw_spot(f);
+                }
+                break;
+            }
+
+            case 6: start_hop(HOP_315_BAND,
+                        sizeof(HOP_315_BAND)/sizeof(float));  break;
+            case 7: start_hop(HOP_ALL_BANDS,
+                        sizeof(HOP_ALL_BANDS)/sizeof(float)); break;
+            case 8: start_spam(315.000f); break;
+            case 9: enter(ST_MAIN);       break;
+        }
     }
 }
 
+static void render_jammer_menu() {
+    auto& d = HW::oled;
+    d.clearDisplay();
+    d.setTextSize(1);
+
+    const int visible = 4;
+    int start = 0;
+    if (g_jammer_menu_idx >= visible) start = g_jammer_menu_idx - visible + 1;
+    if (start > JAMMER_MENU_COUNT - visible)
+        start = JAMMER_MENU_COUNT - visible;
+    if (start < 0) start = 0;
+
+    for (int i = 0; i < visible; ++i) {
+        int idx = start + i;
+        if (idx >= JAMMER_MENU_COUNT) break;
+        int y = 17 + i * 9;
+        bool sel = (idx == g_jammer_menu_idx);
+        if (sel) d.fillRoundRect(1, y, 122, 8, 2, SSD1306_WHITE);
+        d.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE,
+                       sel ? SSD1306_WHITE : SSD1306_BLACK);
+        d.setCursor(4, y);
+        d.print(sel ? ">" : " ");
+        d.setCursor(14, y);
+        d.print(JAMMER_MENU_ITEMS[idx]);
+        d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    }
+
+    // Scrollbar
+    if (JAMMER_MENU_COUNT > visible) {
+        d.drawFastVLine(125, 17, 35, SSD1306_WHITE);
+        int thumb_y = 17 +
+            (g_jammer_menu_idx * (35 - 7)) / (JAMMER_MENU_COUNT - 1);
+        d.fillRect(124, thumb_y, 3, 7, SSD1306_WHITE);
+    }
+
+
+
+    draw_header("JAMMER");
+}
 static void update_jammer_all() {
     HW::led_jammer();
-    if (millis() - g_jammer_enter_ms > 500 && HW::is_pressed(HW::BTN_MID)) {
-        Serial.println(F("[JAM-ALL] stop"));
-        while (HW::is_pressed(HW::BTN_MID)) { HW::buttons_tick(); delay(5); }
-        HW::get_event(HW::BTN_LEFT); HW::get_event(HW::BTN_MID); HW::get_event(HW::BTN_RIGHT);
-        HW::led_idle(); enter(ST_MAIN); return;
+
+    const HW::Ev eM = HW::get_event(HW::BTN_MID);
+    const HW::Ev eL = HW::get_event(HW::BTN_LEFT);
+
+    if (eM == HW::EV_CLICK || eM == HW::EV_LONG) {
+        Jammer::stop();
+        // Nuốt event còn sót
+        HW::get_event(HW::BTN_LEFT);
+        HW::get_event(HW::BTN_MID);
+        HW::get_event(HW::BTN_RIGHT);
+        HW::led_idle();
+        enter(ST_JAMMER_MENU);
+        return;
     }
-    int n = Storage::count();
-    if (n == 0) { enter(ST_MAIN); return; }
-    if (g_jam_all_idx >= n) { g_jam_all_idx = 0; g_jam_all_last_freq = 0; }
-    SavedCode c;
-    if (!Storage::get(g_jam_all_idx, c)) { g_jam_all_idx++; return; }
-    if (c.freq_khz != g_jam_all_last_freq) {                       // ★ v2
-        rf_replay_set_frequency(c.freq_khz / 1000.0f);             // ★ v2
-        g_jam_all_last_freq = c.freq_khz;                          // ★ v2
+    if (eL == HW::EV_LONG) {
+        Jammer::stop();
+        HW::led_idle();
+        enter(ST_JAMMER_MENU);
+        return;
     }
-    rf_replay_send_raw_code(c.payload, c.bits, c.T_us, c.inverted, 2);
-    g_jam_all_idx++;
+
+    // Jammer tự stop (hết dwell hoặc lỗi)
+    if (!Jammer::is_running()) {
+        HW::led_idle();
+        enter(ST_JAMMER_MENU);
+        return;
+    }
+
+    Jammer::tick();
     request_render();
 }
 
@@ -2093,14 +3346,13 @@ static void update_capture_menu() {
     }
 
     if (eR == HW::EV_CLICK) {
-        g_capture_menu_idx = 1 - g_capture_menu_idx;
+        g_capture_menu_idx = (g_capture_menu_idx + 1) % 3;
         request_render();
     }
 
-
     if (eM == HW::EV_CLICK) {
         if (g_capture_menu_idx == 0) {
-            // Default capture
+            // ── STANDARD CAPTURE ──
             rf_listen_end();
             RFListenerConfig cfg = RF_LISTENER_DEFAULT_CONFIG;
             cfg.max_bits = Storage::get_max_bits();
@@ -2111,28 +3363,347 @@ static void update_capture_menu() {
             rf_listen_set_nonblocking(true);
             rf_listen_set_mode(RF_LISTEN_CAPTURE);
             enter(ST_CAPTURE);
+        } else if (g_capture_menu_idx == 1) {
+            // ── ADVANCED CAPTURE ──
+            AdvCapture::AdvConfig acfg;
+            acfg.frequency_mhz   = Storage::get_frequency();
+            acfg.noise_filter_us = 80;
+            acfg.frame_gap_ms    = 12;
+            acfg.max_bits        = Storage::get_max_bits();
+            if (!AdvCapture::begin(acfg)) {
+                HW::led_error();
+                return;
+            }
+            enter(ST_ADV_CAPTURE);
         } else {
-    // Advanced capture
-    AdvCapture::AdvConfig acfg;
-    acfg.frequency_mhz   = Storage::get_frequency();
-    acfg.noise_filter_us = 80;
-    acfg.frame_gap_ms    = 12;
-    acfg.max_bits        = Storage::get_max_bits();   // ★ THÊM DÒNG NÀY
-    if (!AdvCapture::begin(acfg)) {
-        Serial.println(F("[ADV] init FAIL (RAM or CC1101)"));
+            // ── LISTEN RAW ──
+            RawCapture::Config rcfg = {};
+            rcfg.frequency_mhz      = Storage::get_frequency();
+            rcfg.noise_filter_us    = 100;   // ★ 100µs (glitch filter)
+            rcfg.frame_gap_ms       = 8;     // ★ 8ms (timeout đóng frame)
+            rcfg.rssi_threshold_dbm = -95;
+            if (!RawCapture::begin(rcfg)) { HW::led_error(); return; }
+            enter(ST_RAW_CAPTURE);
+        }
+    }
+}
+static void save_raw_to_library() {
+    static uint32_t dur_buf[2048];
+    static uint8_t  lvl_buf[2048];
+    uint16_t n = RawCapture::get_best_frame_edges(dur_buf, lvl_buf, 2048);
+
+    if (n == 0) {
         HW::led_error();
+        Serial.println(F("[RAW] save: NO edges — không lưu được"));
         return;
     }
-    Serial.printf("[ADV] start @ %.3f MHz  cap=%u edges\n",
-                  acfg.frequency_mhz, AdvCapture::get_edge_capacity());
-    enter(ST_ADV_CAPTURE);
-}
+
+    RawCapture::Result r = RawCapture::get_result();
+
+    // Tính duration
+    uint64_t total_us = 0;
+    for (uint16_t i = 0; i < n; i++) total_us += dur_buf[i];
+
+    Serial.printf("[RAW] save: %u edges, %lu.%lums @ %.3fMHz\n",
+                  n,
+                  (unsigned long)(total_us / 1000),
+                  (unsigned long)(total_us % 1000),
+                  r.freq_mhz_x1000 / 1000.0f);
+
+    char initial[MAX_NAME_LEN];
+    snprintf(initial, sizeof(initial), "Raw%d", Storage::raw_count() + 1);
+    char out[MAX_NAME_LEN];
+
+    if (!Keyboard::input_text("Save RAW", initial, out, MAX_NAME_LEN)) return;
+
+    SavedCode sc = {};
+    sc.freq_khz = r.freq_mhz_x1000;
+    sc.repeats  = 15;
+    sc.mode     = SAVED_MODE_RAW;
+    strncpy(sc.name, out, MAX_NAME_LEN - 1);
+    sc.name[MAX_NAME_LEN - 1] = 0;
+
+    int idx = Storage::add_raw(sc, dur_buf, lvl_buf, n);
+    if (idx >= 0) {
+        HW::led_flash(0, 255, 255, 500);
+        Serial.printf("[RAW] ✓ SAVED #%d '%s': %u edges @ %.3fMHz\n",
+                      idx, out, n, r.freq_mhz_x1000 / 1000.0f);
+    } else {
+        HW::led_error();
+        Serial.println(F("[RAW] save FAIL — storage full (7 raw slots)?"));
     }
 }
 
-// ---------------------------------------------------------------------------
-// ★ ADV CAPTURE — đang thu
-// ---------------------------------------------------------------------------
+static bool replay_raw_edges_once() {
+    static uint32_t dur_buf[2048];
+    static uint8_t  lvl_buf[2048];
+    uint16_t n = RawCapture::get_best_frame_edges(dur_buf, lvl_buf, 2048);
+    if (n == 0) {
+        Serial.println(F("[RAW] replay: no edges"));
+        return false;
+    }
+
+    RawCapture::Result r = RawCapture::get_result();
+
+    uint64_t frame_us = 0;
+    for (uint16_t i = 0; i < n; i++) frame_us += dur_buf[i];
+
+    RFReplayConfig rc = RF_REPLAY_DEFAULT_CONFIG;
+    rc.verbose = false;
+    rc.frequency_mhz = r.freq_mhz_x1000 / 1000.0f;
+    if (!rf_replay_begin(rc)) {
+        Serial.println(F("[RAW] replay: rf_begin FAIL"));
+        return false;
+    }
+    rf_replay_set_frequency(rc.frequency_mhz);
+    rf_replay_clear_buttons();
+
+    // ★ FIX: frame dài > 1 giây → chỉ phát 1 lần (tránh 20s chờ)
+    //          frame ngắn < 1s → phát 3 lần (đủ cổng nhận)
+    uint16_t repeats;
+    if (frame_us > 1000000ULL) {
+        repeats = 1;
+        Serial.printf("[RAW] frame %.2fs > 1s → repeat=1\n", frame_us / 1000000.0);
+    } else if (frame_us > 200000ULL) {
+        repeats = 2;
+    } else {
+        repeats = 3;
+    }
+
+    Serial.printf("[RAW] replay %u edges × %u repeats (frame=%.1fms) @ %.3fMHz\n",
+                  n, repeats, frame_us / 1000.0, r.freq_mhz_x1000 / 1000.0f);
+
+    bool ok = rf_replay_send_raw_edges(dur_buf, lvl_buf, n, repeats);
+    Serial.printf("[RAW] replay = %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+static void render_raw_capture() {
+    auto& d = HW::oled;
+    d.clearDisplay();
+    const uint32_t el  = RawCapture::get_elapsed_ms();
+    const uint16_t cnt = RawCapture::get_edge_count();
+    const uint16_t cap = RawCapture::get_edge_capacity();
+    const uint16_t fr  = RawCapture::get_frame_count();
+
+    // Timer
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.1fs", el / 1000.0f);
+    d.setTextSize(3);
+    d.setCursor((128 - strlen(buf) * 18) / 2, 16);
+    d.print(buf);
+
+    // ★ Live RSSI bar — user thấy tín hiệu realtime
+    d.setTextSize(1);
+    // Đọc RSSI mỗi 200ms để không block SPI
+    static int last_rssi = -200;
+    static uint32_t last_rssi_ms = 0;
+    if (millis() - last_rssi_ms > 200) {
+        last_rssi = RawCapture::get_live_rssi_dbm();  // ★ hàm mới
+        last_rssi_ms = millis();
+    }
+    int bar = constrain((last_rssi + 100) * 18 / 70, 0, 18);
+    d.setCursor(3, 40);
+    snprintf(buf, sizeof(buf), "RSSI%4d|", last_rssi);
+    d.print(buf);
+    for (int i = 0; i < 18; i++) d.print(i < bar ? '#' : '.');
+
+    // Edges counter
+    d.setCursor(3, 49);
+    snprintf(buf, sizeof(buf), "E%u/%u F%u", cnt, cap, fr);
+    d.print(buf);
+
+    // Progress bar
+    int barW = cap ? (int)((uint32_t)cnt * 120 / cap) : 0;
+    d.drawRect(3, 56, 122, 4, SSD1306_WHITE);
+    if (barW > 0) d.fillRect(4, 57, barW, 2, SSD1306_WHITE);
+
+    draw_header("LISTEN RAW");
+}
+
+static void render_raw_analyzing() {
+    auto& d = HW::oled;
+    d.clearDisplay();
+    d.setTextSize(2);
+    d.setCursor(20, 28); d.print("ANALYZING");
+    d.setTextSize(1);
+    d.setCursor(20, 52); d.print("Please wait...");
+    draw_header("LISTEN RAW");
+}
+
+// ===========================================================================
+// ★ RAW RESULT
+// ===========================================================================
+static void render_raw_result() {
+    auto& d = HW::oled;
+    d.clearDisplay();
+    d.setTextSize(1);
+    char buf[32];
+
+    RawCapture::Result r = RawCapture::get_result();
+    if (!r.valid || r.best_frame_count == 0) {
+        d.setCursor(8, 22);  d.print("NO SIGNAL CAPTURED");
+        d.setCursor(8, 32);  d.print("Try holding longer");
+        d.setCursor(8, 42);  d.print("(press & release remote)");
+        d.setCursor(8, 56);  d.print("L = RETRY  M = SAVE?");
+        draw_header("RAW RESULT");
+        return;
+    }
+
+    // Log detail 1 lần duy nhất khi vào state này
+    static RawCapture::Result last_logged = {};
+    if (last_logged.valid != r.valid ||
+        last_logged.best_frame_count != r.best_frame_count ||
+        last_logged.freq_mhz_x1000 != r.freq_mhz_x1000) {
+
+        last_logged = r;
+        Serial.println(F("\n[RAW] ======== CAPTURE DETAIL ========"));
+        Serial.printf("[RAW] freq     = %.3f MHz\n", r.freq_mhz_x1000 / 1000.0f);
+        Serial.printf("[RAW] rssi     = %d dBm\n", r.rssi_dbm);
+        Serial.printf("[RAW] frames   = %u\n", r.frame_count);
+        Serial.printf("[RAW] total    = %u edges\n", r.total_edges);
+        Serial.printf("[RAW] best     = %u edges (start=%u)\n",
+                      r.best_frame_count, r.best_frame_start);
+
+        // Log 12 edges đầu của best frame
+        static uint32_t dur_log[2048];
+        static uint8_t  lvl_log[2048];
+        uint16_t n = RawCapture::get_best_frame_edges(dur_log, lvl_log, 2048);
+        Serial.printf("[RAW] ---- first %u edges of best frame ----\n",
+                      n < 12 ? n : 12);
+        for (uint16_t i = 0; i < n && i < 12; i++) {
+            Serial.printf("[RAW]   [%2u] %s %luus\n",
+                          i, lvl_log[i] ? "HIGH" : "LOW ",
+                          (unsigned long)dur_log[i]);
+        }
+        if (n > 12)
+            Serial.printf("[RAW]   ... %u more edges\n", n - 12);
+
+        // Tổng duration
+        uint64_t total_us = 0;
+        for (uint16_t i = 0; i < n; i++) total_us += dur_log[i];
+        Serial.printf("[RAW] duration ~ %lu.%03lu ms\n",
+                      (unsigned long)(total_us / 1000),
+                      (unsigned long)(total_us % 1000));
+        Serial.println(F("[RAW] ==============================\n"));
+    }
+
+    // Hiển thị UI
+    d.setCursor(3, 19);
+    snprintf(buf, sizeof(buf), "Frames %u  Best %u",
+             r.frame_count, r.best_frame_count);
+    d.print(buf);
+
+    d.setCursor(3, 29);
+    snprintf(buf, sizeof(buf), "Total %u edges", r.total_edges);
+    d.print(buf);
+
+    d.drawRoundRect(1, 38, 126, 11, 2, SSD1306_WHITE);
+    d.setCursor(4, 40);
+    snprintf(buf, sizeof(buf), "%.3f MHz  %ddBm",
+             r.freq_mhz_x1000 / 1000.0f, r.rssi_dbm);
+    d.print(buf);
+
+    d.setCursor(3, 52);
+    d.print("M=PLAY  R=SAVE  L=BACK");
+
+    d.setCursor(3, 60);
+    d.print("(hold MID to cancel)");
+
+    draw_header("RAW RESULT");
+}
+
+static void update_raw_capture() {
+    if (HW::get_event(HW::BTN_LEFT) == HW::EV_CLICK) {
+        RawCapture::cancel();
+        enter(ST_CAPTURE_MENU);
+        return;
+    }
+    if (HW::get_event(HW::BTN_MID) == HW::EV_CLICK) {
+        RawCapture::stop_early();
+    }
+
+    RawCapture::update();
+
+    RawCapture::State s = RawCapture::get_state();
+    if (s == RawCapture::RC_ANALYZING) {
+        render_raw_analyzing();
+        HW::oled.display();
+        delay(80);
+        RawCapture::analyze();
+        enter(ST_RAW_RESULT);
+        return;
+    }
+    if (RawCapture::get_frame_count() > 0) {
+        HW::led_set_theme(0, 255, 120); // Báo xanh lá khi đã tóm được frame
+    } else {
+        HW::led_set_theme(200, 150, 0); // Vàng cam khi đang lắng nghe
+    }
+}
+
+static void update_raw_result() {
+    HW::Ev eL = HW::get_event(HW::BTN_LEFT);
+    HW::Ev eM = HW::get_event(HW::BTN_MID);
+    HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
+
+    RawCapture::Result r = RawCapture::get_result();
+
+    // Hold MID 2s = cancel & exit
+    if (HW::is_long_pressed(HW::BTN_MID, 2000)) {
+        while (HW::is_pressed(HW::BTN_MID)) { HW::buttons_tick(); delay(5); }
+        HW::get_event(HW::BTN_LEFT); HW::get_event(HW::BTN_MID); HW::get_event(HW::BTN_RIGHT);
+        RawCapture::end();
+        HW::led_idle();
+        enter(ST_CAPTURE_MENU);
+        return;
+    }
+
+    if (eL == HW::EV_CLICK) {
+        RawCapture::end();
+        RawCapture::Config rcfg;
+        rcfg.frequency_mhz   = Storage::get_frequency();
+        rcfg.noise_filter_us = 150;   // ★ 70 → 150
+        rcfg.frame_gap_ms    = 12;    // ★ 8 → 12
+        if (RawCapture::begin(rcfg)) {
+            enter(ST_RAW_CAPTURE);
+        } else {
+            enter(ST_CAPTURE_MENU);
+        }
+        return;
+    }
+
+    // R = save to library
+    if (eR == HW::EV_CLICK) {
+        save_raw_to_library();
+        request_render();
+        return;
+    }
+
+    // M = replay (stay on screen)
+    if (eM == HW::EV_CLICK) {
+        if (!r.valid || r.best_frame_count == 0) return;
+
+        HW::led_flash(200, 0, 255, 200);
+        bool ok = replay_raw_edges_once();
+        if (ok) HW::led_tx_ok();
+        else    HW::led_error();
+
+        // Re-init RX để lần capture tiếp theo vẫn OK
+        RawCapture::Config rcfg;
+        rcfg.frequency_mhz   = Storage::get_frequency();
+            rcfg.noise_filter_us = 150;   // ★ 70 → 150
+            rcfg.frame_gap_ms    = 12;    // ★ 8 → 12
+        // (Không reinit ở đây để giữ dữ liệu đã capture — user phải bấm L để bắt lại)
+
+        request_render();
+        return;
+    }
+
+    if (RawCapture::get_frame_count() > 0) {
+        HW::led_set_theme(0, 255, 120); // Báo xanh lá khi đã tóm được frame
+    } else {
+        HW::led_set_theme(200, 150, 0); // Vàng cam khi đang lắng nghe
+    }
+}
 static void update_adv_capture() {
     // LEFT = cancel
     if (HW::get_event(HW::BTN_LEFT) == HW::EV_CLICK) {
@@ -2227,7 +3798,7 @@ if (eL == HW::EV_CLICK) {
         return;
     }
 
-    // RIGHT = replay trực tiếp
+        // RIGHT = replay trực tiếp
     if (eR == HW::EV_CLICK) {
         if (g_adv_result.repeats == 0) return;
         g_play.payload   = g_adv_result.payload;
@@ -2236,11 +3807,13 @@ if (eL == HW::EV_CLICK) {
         g_play.inverted  = g_adv_result.inverted;
         g_play.freq_khz  = g_adv_result.freq_mhz_x1000;
         g_play.repeats   = DEFAULT_REPEATS;
+        g_play.mode      = SAVED_MODE_PROTO;   // ★ FIX
+        g_play_idx_raw   = -1;                  // ★ FIX
         strncpy(g_play.name, g_adv_result.protocol, MAX_NAME_LEN - 1);
         g_play.name[MAX_NAME_LEN - 1] = 0;
         AdvCapture::end();
         if (setup_tx_and_bind()) enter(ST_REPLAY);
-        else enter(ST_MAIN);
+        else                     enter(ST_MAIN);
         return;
     }
 }
@@ -2365,6 +3938,8 @@ void update() {
 case ST_BRUCE_DEBRUIJN_RUNNING: update_bruce_debruijn_running(); break;
     case ST_BOOT:           update_boot();           break;
     case ST_MAIN:           update_main();           break;
+    case ST_SCAN_MENU:      update_scan_menu();      break;
+    case ST_SCAN_HISTORY:   update_scan_history();   break;
     case ST_SCAN:           update_scan();           break;
     case ST_CAPTURE:        update_capture();        break;
     case ST_CAPTURE_DONE:   update_capture_done();   break;
@@ -2373,14 +3948,21 @@ case ST_BRUCE_DEBRUIJN_RUNNING: update_bruce_debruijn_running(); break;
     case ST_SAVED_MODE_SELECT: update_saved_mode_select(); break;
     case ST_SAVED_BTN_COUNT:   update_saved_btn_count();   break;
     case ST_SAVED_BTN_TX:      update_saved_btn_tx();      break;
-    case ST_REPLAY:         update_replay();         break;
-    case ST_JAMMER:         update_jammer();         break;
+    case ST_AUTO_BTN_DETAIL:   update_auto_btn_detail();   break;
+    case ST_JAM_MODE_SELECT:   update_jam_mode_select();   break;
+    case ST_JAM_DELAY_SPEED:   update_jam_delay_speed();   break;
+    case ST_JAM_RUNNING:       update_jam_running();       break;
+    case ST_REPLAY:            update_replay();            break;
+    case ST_JAMMER:            update_jam_running();       break;
     case ST_JAMMER_ALL:     update_jammer_all();     break;
+    case ST_JAMMER_MENU:    update_jammer_menu();    break;
     case ST_BRUCE_MENU:     update_bruce_menu();     break;
     case ST_BRUCE_RUNNING:  update_bruce_running();  break;
     case ST_SETTINGS:       update_settings();       break;
     case ST_ABOUT:          update_about();          break;
     // ★ v3
+    case ST_RAW_CAPTURE:    update_raw_capture();    break;
+case ST_RAW_RESULT:     update_raw_result();     break;
     case ST_CAPTURE_MENU:   update_capture_menu();   break;
     case ST_ADV_CAPTURE:    update_adv_capture();    break;
     case ST_ADV_RESULT:     update_adv_result();     break;
@@ -2392,17 +3974,26 @@ case ST_BRUCE_DEBRUIJN_RUNNING: update_bruce_debruijn_running(); break;
 case ST_BRUCE_DEBRUIJN_RUNNING: render_bruce_debruijn_running(); break;
             case ST_BOOT:           render_boot();              break;
             case ST_MAIN:           render_main();              break;
+            case ST_SCAN_MENU:      render_scan_menu();         break;
+            case ST_SCAN_HISTORY:   render_scan_history();      break;
             case ST_SCAN:           render_scan();              break;
             case ST_CAPTURE:        render_capture_listening(); break;
+            case ST_RAW_CAPTURE:    render_raw_capture();    break;
+case ST_RAW_RESULT:     render_raw_result();     break;
             case ST_CAPTURE_DONE:   render_capture_done();      break;
             case ST_SAVED_LIST:     render_saved_list();        break;
             case ST_SAVED_DETAIL:   render_saved_detail();      break;
             case ST_SAVED_MODE_SELECT: render_saved_mode_select(); break;
             case ST_SAVED_BTN_COUNT:   render_saved_btn_count();   break;
             case ST_SAVED_BTN_TX:      render_saved_btn_tx();      break;
-            case ST_REPLAY:         render_replay();            break;
-            case ST_JAMMER:         render_jammer();            break;
+            case ST_AUTO_BTN_DETAIL:   render_auto_btn_detail();   break;
+            case ST_JAM_MODE_SELECT:   render_jam_mode_select();   break;
+            case ST_JAM_DELAY_SPEED:   render_jam_delay_speed();   break;
+            case ST_JAM_RUNNING:       render_jam_running();       break;
+            case ST_REPLAY:            render_replay();            break;
+            case ST_JAMMER:            render_jam_running();       break;
             case ST_JAMMER_ALL:     render_jammer_all();        break;
+            case ST_JAMMER_MENU:    render_jammer_menu();    break;
             case ST_BRUCE_MENU:     render_bruce_menu();        break;
             case ST_BRUCE_RUNNING:  render_bruce_running();     break;
             case ST_SETTINGS:

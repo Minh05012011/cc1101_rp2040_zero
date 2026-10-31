@@ -1,8 +1,9 @@
 /*
  * ============================================================================
- *  RF Listener v2.0 — RP2040 + CC1101
- *  Fix scan: AGC nhạy hơn, multi-sample RSSI, threshold -70dBm mặc định
- *  Fix capture: parallel T estimation, single-shot confirm, nhiều protocol
+ *  RF Listener v3.0 — RP2040 + CC1101
+ *  v3.1: FIX Bug #2 (off-by-one n-1→n), FIX Bug #3 (glitch reject order),
+ *        ADD debug log [DBG] trong capture_iteration để chẩn đoán.
+ *  KHÔNG đổi MDMCFG4/MDMCFG3 (data rate giữ nguyên như bản gốc).
  * ============================================================================
  */
 
@@ -79,7 +80,7 @@ struct Packet {
     bool     inverted;
     bool     valid;
     char     protocol[20];
-    uint8_t  confidence;   // ★ v2
+    uint8_t  confidence;
 };
 
 struct Group {
@@ -115,8 +116,9 @@ static uint8_t          g_cacheCount   = 0;
 
 static float            g_last_peak_freq = 0.0f;
 static int              g_last_peak_rssi = -200;
+static bool             g_last_peak_is_hit = false;
 
-static SPISettings      g_spi(2000000, MSBFIRST, SPI_MODE0);  // ★ v2: 2MHz
+static SPISettings      g_spi(2000000, MSBFIRST, SPI_MODE0);
 
 // Edge capture
 static volatile uint32_t g_edgeDur[RF_LISTEN_MAX_EDGES];
@@ -128,13 +130,14 @@ static volatile bool     g_lastLevel  = false;
 static volatile bool     g_capturing  = false;
 static volatile uint32_t g_overflow   = 0;
 
-// Frequency list cho SCAN — tối ưu 433/315/868
+// ---------------------------------------------------------------------------
+// Danh sách tần số
+// ---------------------------------------------------------------------------
 static const float FREQ_LIST[] = {
     300.000f, 303.875f, 303.900f, 307.000f, 310.000f, 312.000f,
     313.000f, 314.350f, 315.000f, 318.000f, 330.000f, 345.000f,
     348.000f, 350.000f, 387.000f, 390.000f, 418.000f, 430.000f,
     430.500f, 431.000f, 431.500f,
-    // ★ Dải 433 MHz — dày hơn vì phổ biến nhất
     433.050f, 433.100f, 433.200f, 433.420f, 433.657f, 433.780f,
     433.850f, 433.880f, 433.900f, 433.920f, 433.950f,
     434.000f, 434.050f, 434.075f, 434.150f, 434.177f, 434.200f,
@@ -144,6 +147,40 @@ static const float FREQ_LIST[] = {
     915.000f, 925.000f, 928.000f,
 };
 static const size_t FREQ_COUNT = sizeof(FREQ_LIST) / sizeof(FREQ_LIST[0]);
+
+static const float FREQ_LIST_FAST[] = {
+    300.000f, 303.875f, 303.900f, 307.000f, 310.000f, 312.000f,
+    313.000f, 314.350f, 315.000f, 318.000f,
+    418.000f, 430.000f, 430.500f, 431.000f, 431.500f,
+    433.050f, 433.100f, 433.200f, 433.420f, 433.657f, 433.780f,
+    433.850f, 433.880f, 433.900f, 433.920f, 433.950f,
+    434.000f, 434.050f, 434.075f, 434.150f, 434.177f, 434.200f,
+    434.390f, 434.420f, 434.620f, 434.775f,
+    438.900f, 440.175f,
+};
+static const size_t FREQ_FAST_COUNT = sizeof(FREQ_LIST_FAST) / sizeof(FREQ_LIST_FAST[0]);
+
+static RFScanBand g_scan_band = RF_SCAN_BAND_ALL;
+
+static inline const float* scan_band_list() {
+    return (g_scan_band == RF_SCAN_BAND_FAST) ? FREQ_LIST_FAST : FREQ_LIST;
+}
+static inline size_t scan_band_count() {
+    return (g_scan_band == RF_SCAN_BAND_FAST) ? FREQ_FAST_COUNT : FREQ_COUNT;
+}
+static inline uint32_t scan_band_settle_ms() {
+    if (g_scan_band == RF_SCAN_BAND_FAST)
+        return (g_cfg.settle_time_ms > 2) ? 2 : g_cfg.settle_time_ms;
+    return g_cfg.settle_time_ms;
+}
+static inline size_t scan_band_step() {
+    return (g_scan_band == RF_SCAN_BAND_FAST) ? scan_band_count() : 2;
+}
+
+#define HIT_HOLD_MS        5500
+
+static uint32_t g_hit_latch_ms   = 0;
+static bool     g_scan_hit_flag  = false;
 
 // ---------------------------------------------------------------------------
 // SPI primitives
@@ -182,22 +219,22 @@ static void cc_set_freq_regs(float mhz) {
     cc_write(CC_FREQ0, v & 0xFF);
 }
 
-// ★ v2: đọc RSSI nhiều lần rồi lấy max (tránh đọc trúng khoảng yên lặng)
+static inline int rssi_conv(uint8_t raw) {
+    return (raw >= 128) ? ((int)raw - 256) / 2 - 74 : (int)raw / 2 - 74;
+}
+
 static int cc_read_rssi_dbm() {
     int best = -200;
     for (int i = 0; i < 3; i++) {
         delayMicroseconds(150);
-        uint8_t raw = cc_read_status(CC_RSSI);
-        int v;
-        if (raw >= 128) v = (int)((int8_t)(raw - 256) / 2) - 74;
-        else             v = (int)(raw / 2) - 74;
+        int v = rssi_conv(cc_read_status(CC_RSSI));
         if (v > best) best = v;
     }
     return best;
 }
 
 // ---------------------------------------------------------------------------
-// CC1101 init — cấu hình OOK broadband
+// CC1101 init — cấu hình OOK broadband (GIỮ NGUYÊN data rate gốc)
 // ---------------------------------------------------------------------------
 static bool cc_init_hw() {
     pinMode(g_cfg.pin_csn, OUTPUT); digitalWrite(g_cfg.pin_csn, HIGH);
@@ -213,10 +250,9 @@ static bool cc_init_hw() {
     if (g_cfg.verbose) Serial.printf("[RFListen] PARTNUM=0x%02X VERSION=0x%02X\n", part, ver);
     if (ver == 0x00 || ver == 0xFF) return false;
 
-    // GDO0 = carrier sense (async serial data output = signal present)
     cc_write(CC_IOCFG2, 0x0D);
     cc_write(CC_IOCFG1, 0x2E);
-    cc_write(CC_IOCFG0, 0x0D);   // GDO0 = sync output (carrier detect)
+    cc_write(CC_IOCFG0, 0x0D);
 
     cc_write(CC_FIFOTHR,  0x47);
     cc_write(CC_SYNC1,    0xD3);
@@ -231,9 +267,8 @@ static bool cc_init_hw() {
     cc_write(CC_FSCTRL0,  0x00);
     cc_set_freq_regs(g_cfg.frequency_mhz);
 
-    // ★ v2: bandwidth rộng hơn (600kHz) để bắt được nhiều remote hơn
-    // MDMCFG4: CHANBW_E=0, CHANBW_M=0 => BW=812kHz; DRATE_E=5
-    cc_write(CC_MDMCFG4,  0x07);   // BW=325kHz, DRATE_E=7 (cân bằng)
+    // ★ KHÔNG ĐỔI — data rate giữ nguyên như bản gốc
+    cc_write(CC_MDMCFG4,  0x07);   // BW=812kHz, DRATE_E=7
     cc_write(CC_MDMCFG3,  0x83);   // DRATE_M=131
     cc_write(CC_MDMCFG2,  0x30);   // OOK, no Manchester, no sync check
     cc_write(CC_MDMCFG1,  0x00);
@@ -242,16 +277,15 @@ static bool cc_init_hw() {
 
     cc_write(CC_MCSM2, 0x07);
     cc_write(CC_MCSM1, 0x30);
-    cc_write(CC_MCSM0, 0x18);  // ★ v2: FS_AUTOCAL=01 (calibrate khi vào RX)
+    cc_write(CC_MCSM0, 0x18);
 
     cc_write(CC_FOCCFG, 0x18);
     cc_write(CC_BSCFG,  0x6C);
 
     if (g_cfg.agc_sensitive) {
-        // ★ v2: AGC nhạy hơn — quan trọng cho remote yếu/xa
-        cc_write(CC_AGCCTRL2, 0x03);   // MAX_DVGA_GAIN=00, MAX_LNA_GAIN=000, MAGN_TARGET=011 (33dBm)
-        cc_write(CC_AGCCTRL1, 0x00);   // CS_REL_THR=0, CS_ABS_THR=0
-        cc_write(CC_AGCCTRL0, 0x91);   // HYST_LEVEL=10, WAIT_TIME=01, AGC_FREEZE=00, FILTER_LENGTH=01
+        cc_write(CC_AGCCTRL2, 0x03);
+        cc_write(CC_AGCCTRL1, 0x00);
+        cc_write(CC_AGCCTRL0, 0x91);
     } else {
         cc_write(CC_AGCCTRL2, 0x43);
         cc_write(CC_AGCCTRL1, 0x40);
@@ -286,18 +320,19 @@ static void cc_enter_rx(float mhz) {
     cc_set_freq_regs(mhz);
     cc_strobe(CC_SFRX);
     cc_strobe(CC_SRX);
-    delay(12);   // ★ v2: chờ PLL lock + AGC settle
+    delay(12);
 }
 
 // ---------------------------------------------------------------------------
 // Edge capture ISR
+// ★ FIX Bug #3: reject glitch TRƯỚC, không đụng g_lastEdgeUs khi reject
 // ---------------------------------------------------------------------------
 static void __not_in_flash_func(on_gdo0_edge)() {
     if (!g_capturing) return;
     uint32_t now = micros();
     uint32_t dt  = now - g_lastEdgeUs;
-    g_lastEdgeUs = now;
-    if (dt < 20) return;  // ★ v2: tăng từ 15 lên 20µs để lọc glitch
+    if (dt < 20) return;              // ★ FIX: reject TRƯỚC
+    g_lastEdgeUs = now;               // ★ FIX: chỉ update khi chấp nhận
     if (g_edgeCount < RF_LISTEN_MAX_EDGES) {
         g_edgeDur[g_edgeCount]   = dt;
         g_edgeLevel[g_edgeCount] = g_lastLevel ? 1 : 0;
@@ -327,7 +362,6 @@ static int cmp_u32(const void *a, const void *b) {
     return (va > vb) - (va < vb);
 }
 
-// ★ v2: estimate_T cải thiện — cluster analysis để tìm T thật
 static uint32_t estimate_T(const uint32_t *dur, uint16_t n, uint32_t noise_min) {
     static uint32_t tmp[RF_LISTEN_MAX_EDGES];
     size_t cnt = 0;
@@ -337,23 +371,20 @@ static uint32_t estimate_T(const uint32_t *dur, uint16_t n, uint32_t noise_min) 
     if (cnt < 4) return 0;
     qsort(tmp, cnt, sizeof(uint32_t), cmp_u32);
 
-    // ★ Tìm nhóm nhỏ nhất (T) bằng cách tìm cluster dày nhất ở phần dưới
     uint32_t best_T = 0;
     size_t   best_count = 0;
     for (size_t i = 0; i + 2 < cnt; i++) {
-        // Xem nếu tmp[i..i+2] nằm trong 1.4x nhau (1 cluster)
         if (tmp[i + 2] < (uint32_t)(tmp[i] * 1.5f)) {
             size_t w = 3;
             while (i + w < cnt && tmp[i + w] < (uint32_t)(tmp[i] * 1.5f)) w++;
             if (w > best_count) {
                 best_count = w;
-                best_T = tmp[i + w / 2];  // median của cluster
+                best_T = tmp[i + w / 2];
             }
         }
     }
     if (best_T >= 80 && best_T <= 2500) return best_T;
 
-    // Fallback: phương pháp cũ
     for (size_t i = 0; i + 3 < cnt; i++) {
         if (tmp[i+3] < tmp[i] * 5 / 4) return tmp[i + 1];
     }
@@ -363,11 +394,10 @@ static uint32_t estimate_T(const uint32_t *dur, uint16_t n, uint32_t noise_min) 
 static uint16_t find_syncs(const uint32_t *dur, const uint8_t *lvl, uint16_t n,
                             uint32_t T, uint16_t *out, uint16_t max_out) {
     uint16_t cnt = 0;
-    uint32_t thresh = 10 * T;  // ★ v2: giảm từ 15T xuống 10T (Came sync ~11T)
+    uint32_t thresh = 10 * T;
     for (uint16_t i = 0; i < n; i++) {
         if (lvl[i] == 0 && dur[i] > thresh && cnt < max_out) out[cnt++] = i;
     }
-    // ★ v2: cũng thử sync HIGH (một số protocol dùng HIGH sync)
     if (cnt == 0) {
         thresh = 8 * T;
         for (uint16_t i = 0; i < n; i++) {
@@ -384,7 +414,6 @@ static int decode_from_offset(const uint32_t *dur, const uint8_t *lvl,
     uint8_t bitStartLevel = lvl[s];
     if (try_invert) bitStartLevel = !bitStartLevel;
 
-    uint32_t thresh2 = 2 * T;
     uint64_t payload = 0;
     int bits = 0, noise_edges = 0;
     uint16_t j = s;
@@ -392,7 +421,6 @@ static int decode_from_offset(const uint32_t *dur, const uint8_t *lvl,
     while (j + 1 < end) {
         if (lvl[j] != bitStartLevel) { j++; continue; }
         uint32_t a = dur[j], b = dur[j + 1];
-        // ★ v2: tolerance ±40% thay vì cứng 2T
         bool a_short = a < (uint32_t)(T * 1.8f);
         bool b_short = b < (uint32_t)(T * 1.8f);
         int bit;
@@ -405,7 +433,6 @@ static int decode_from_offset(const uint32_t *dur, const uint8_t *lvl,
         if (bits >= 64) break;
     }
     if (bits < 8) return 0;
-    // ★ v2: score tính thêm chiều dài bit và noise ratio
     int noise_ratio = (bits > 0) ? (noise_edges * 100 / (bits + noise_edges)) : 100;
     int score = bits * 12 - noise_ratio * 2;
 
@@ -424,7 +451,7 @@ static bool decode_segment_best(const uint32_t *dur, const uint8_t *lvl,
                                  uint32_t T, Packet &out) {
     int best_score = 0;
     Packet best{};
-    for (uint16_t off = 0; off < 6; off++) {  // ★ v2: thử 6 offset
+    for (uint16_t off = 0; off < 6; off++) {
         uint16_t s = syncStart + 1 + off;
         if (s + 4 >= end) break;
         Packet p1{}, p2{};
@@ -438,13 +465,11 @@ static bool decode_segment_best(const uint32_t *dur, const uint8_t *lvl,
     return true;
 }
 
-// ★ v2: thử decode với nhiều giá trị T khác nhau quanh T ước tính
 static bool decode_multi_T(const uint32_t *dur, const uint8_t *lvl, uint16_t n,
                             uint32_t T_est, uint16_t syncStart, uint16_t end, Packet &out) {
     if (T_est == 0) return false;
     int best_score = 0;
     Packet best{};
-    // Thử T * 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15
     static const float mults[] = {0.85f, 0.90f, 0.95f, 1.00f, 1.05f, 1.10f, 1.15f};
     for (size_t m = 0; m < 7; m++) {
         uint32_t T = (uint32_t)(T_est * mults[m]);
@@ -469,8 +494,8 @@ static void label_protocol(Packet &pkt) {
     else if (!inv && bits == 24 && T < 250) strcpy(pkt.protocol, "EV1527-fast");
     else if (!inv && bits == 24) strcpy(pkt.protocol, "EV1527/PT2262");
     else if (inv && bits == 12 && T >= 250 && T <= 400) strcpy(pkt.protocol, "Came");
-    else if (inv && bits == 12 && T >= 180 && T < 250) strcpy(pkt.protocol, "Came-fast");  // ★ v2
-    else if (inv && bits == 12 && T >= 400 && T <= 700) strcpy(pkt.protocol, "Came/Ansonic");// ★ v2
+    else if (inv && bits == 12 && T >= 180 && T < 250) strcpy(pkt.protocol, "Came-fast");
+    else if (inv && bits == 12 && T >= 400 && T <= 700) strcpy(pkt.protocol, "Came/Ansonic");
     else if (inv && bits == 12 && T >= 700 && T <= 900) strcpy(pkt.protocol, "Nice");
     else if (!inv && bits == 12) strcpy(pkt.protocol, "Holtek/Ansonic");
     else if (inv && bits == 12) strcpy(pkt.protocol, "Came/Nice?");
@@ -513,7 +538,6 @@ static uint16_t group_packets(Packet *pkts, uint16_t n, Group *groups, uint16_t 
             if (same_code(pkts[i], pkts[j])) {
                 assigned[j] = true;
                 g.members[g.count++] = j;
-                // Giữ bản có nhiều bit hơn hoặc confidence cao hơn
                 if (pkts[j].bits > g.best.bits ||
                     (pkts[j].bits == g.best.bits && pkts[j].confidence > g.best.confidence))
                     g.best = pkts[j];
@@ -524,7 +548,6 @@ static uint16_t group_packets(Packet *pkts, uint16_t n, Group *groups, uint16_t 
     return nG;
 }
 
-// Cache
 static void cache_clean() {
     uint32_t now = millis();
     uint8_t w = 0;
@@ -578,7 +601,7 @@ static void publish_result(const Packet &bp, int8_t rssi) {
     g_result.inverted = bp.inverted;
     strncpy(g_result.protocol, bp.protocol, sizeof(g_result.protocol) - 1);
     g_result.protocol[sizeof(g_result.protocol) - 1] = 0;
-        g_result.frequency_mhz_x1000 = (uint32_t)(g_cfg.frequency_mhz * 1000.0f + 0.5f);
+    g_result.frequency_mhz_x1000 = (uint32_t)(g_cfg.frequency_mhz * 1000.0f + 0.5f);
     g_result.timestamp_ms = millis();
     g_result.rssi_dbm  = rssi;
     g_result.confidence = bp.confidence;
@@ -588,7 +611,7 @@ static void publish_result(const Packet &bp, int8_t rssi) {
 }
 
 // ---------------------------------------------------------------------------
-// Decode frame — v2: multi-T, single-shot confirm
+// Decode frame
 // ---------------------------------------------------------------------------
 static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
                          uint16_t n, bool printRaw, int8_t rssi) {
@@ -596,8 +619,6 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
 
     uint32_t T = estimate_T(dur, n, g_cfg.noise_filter_us);
 
-    // ★ v2: Layer 1 — loại nhiễu xung ngắn (89µs, 100µs từ log thực tế)
-    // Remote thật: EV1527/PT2262 ≥ 250µs, Came/Nice ≥ 185µs
     if (T < 150) {
         if (printRaw && g_cfg.verbose)
             Serial.printf("⚠ T=%luµs < 150 → noise\n", (unsigned long)T);
@@ -611,10 +632,8 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
     uint16_t syncIdx[64];
     uint16_t nSync = find_syncs(dur, lvl, n, T, syncIdx, 64);
     if (nSync < 1) {
-        // ★ v2: thử decode không cần sync (một số protocol đơn giản)
         Packet pkt{};
         if (decode_multi_T(dur, lvl, n, T, 0, n - 1, pkt) && pkt.bits >= 12) {
-            // ★ Layer 6: chặn rác dài (54–60 bit) trước khi label/cache
             if (pkt.bits > g_cfg.max_bits) {
                 if (printRaw && g_cfg.verbose)
                     Serial.printf("⚠ NO-SYNC %u bit > max(%u) → bỏ qua\n",
@@ -649,7 +668,8 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
     }
     if (nSync >= 1 && nPkt < RF_LISTEN_MAX_PACKETS) {
         Packet pkt{};
-        if (decode_multi_T(dur, lvl, n, T, syncIdx[nSync - 1], n - 1, pkt)) {
+        // ★ FIX Bug #2: n-1 → n (để xử lý được cặp edge cuối cùng)
+        if (decode_multi_T(dur, lvl, n, T, syncIdx[nSync - 1], n, pkt)) {
             label_protocol(pkt);
             packets[nPkt++] = pkt;
         }
@@ -666,7 +686,6 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
     if (nFilt == 0)
         for (uint16_t i = 0; i < nPkt; i++)
             if (packets[i].bits >= 12) filtered[nFilt++] = packets[i];
-    // ★ v2: bỏ fallback ≥8 — nhiễu 0xF0 (8 bit) không còn lọt
     if (nFilt == 0) {
         if (printRaw && g_cfg.verbose)
             Serial.println(F("⚠ Tất cả packet < 12 bit → noise"));
@@ -689,7 +708,6 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
     const Packet &bp  = groups[best_g].best;
     uint16_t      cnt = groups[best_g].count;
 
-    // ★ v2: Layer 6 — lọc theo max_bits do user cấu hình
     if (bp.bits > g_cfg.max_bits) {
         if (g_cfg.verbose)
             Serial.printf("⚠ %u bit > max(%u) → nghi rác\n",
@@ -703,10 +721,6 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
     uint8_t total_hits = cnt + prev_hits;
     cache_put(bp);
 
-    // ★ v2: confirm ngay từ lần đầu nếu:
-    //   - confidence >= 70 (decode rõ ràng), HOẶC
-    //   - 2+ packet giống nhau trong 1 frame, HOẶC
-    //   - đã thấy trước đó trong cache
     bool confirmed = (bp.confidence >= 70)
                   || (cnt >= 2)
                   || (total_hits >= 2);
@@ -737,83 +751,111 @@ static bool decode_frame(const uint32_t *dur, const uint8_t *lvl,
 }
 
 // ---------------------------------------------------------------------------
-// SCAN (non-blocking)
+// SCAN
 // ---------------------------------------------------------------------------
+static int scan_probe_rssi_ex(float mhz, uint32_t settle_ms) {
+    cc_strobe(CC_SIDLE); delayMicroseconds(200);
+    cc_set_freq_regs(mhz);
+    cc_strobe(CC_SFRX); cc_strobe(CC_SRX);
+    delay(settle_ms);
+    return cc_read_rssi_dbm();
+}
+static int scan_probe_rssi(float mhz) {
+    return scan_probe_rssi_ex(mhz, g_cfg.settle_time_ms);
+}
+
+static size_t   s_scan_idx      = 0;
+static float    s_scan_peakFreq = 0;
+static int      s_scan_peakRssi = -200;
+static uint32_t s_scan_sweep    = 0;
+static uint32_t s_scan_t0       = 0;
+
+static void scan_state_reset() {
+    s_scan_idx      = 0;
+    s_scan_peakFreq = 0;
+    s_scan_peakRssi = -200;
+    s_scan_t0       = millis();
+}
+
 static void run_scan() {
-    static size_t   s_idx      = 0;
-    static float    s_peakFreq = 0;
-    static int      s_peakRssi = -200;
-    static uint32_t s_sweep    = 0;
-    static uint32_t s_t0       = 0;
+    g_capturing = false;
+
+    const float  *list    = scan_band_list();
+    const size_t  count   = scan_band_count();
+    const uint32_t settle = scan_band_settle_ms();
 
     if (!g_nonblocking) {
         if (g_cfg.verbose)
             Serial.println(F("\n[SCAN] Quét dải — gõ phím + Enter để dừng\n"));
-        g_capturing = false;
         while (g_mode == RF_LISTEN_SCAN) {
             if (Serial.available()) return;
-            s_sweep++;
-            s_t0 = millis();
-            float peakFreq = 0; int peakRssi = -200; int printed = 0;
-            for (size_t i = 0; i < FREQ_COUNT; i++) {
+            s_scan_sweep++;
+            s_scan_t0 = millis();
+            float peakFreq = 0; int peakRssi = -200;
+            for (size_t i = 0; i < count; i++) {
                 if (Serial.available()) return;
-                float f = FREQ_LIST[i];
-                cc_strobe(CC_SIDLE); delayMicroseconds(200);
-                cc_set_freq_regs(f);
-                cc_strobe(CC_SFRX); cc_strobe(CC_SRX);
-                delay(g_cfg.settle_time_ms);
-                int rssi = cc_read_rssi_dbm();
-                if (rssi > peakRssi) { peakRssi = rssi; peakFreq = f; }
+                int rssi = scan_probe_rssi_ex(list[i], settle);
+                if (rssi > peakRssi) { peakRssi = rssi; peakFreq = list[i]; }
                 if (g_cfg.verbose && rssi >= g_cfg.scan_threshold_dbm) {
                     int bar = constrain((rssi + 100) * 20 / 70, 0, 20);
-                    Serial.printf("  %8.3f MHz |", f);
+                    Serial.printf("  %8.3f MHz |", list[i]);
                     for (int b = 0; b < 20; b++) Serial.print(b < bar ? '#' : '.');
                     Serial.printf("| %4d dBm\n", rssi);
-                    printed++;
                 }
             }
-            g_last_peak_freq = peakFreq;
-            g_last_peak_rssi = peakRssi;
+            bool is_hit = (peakRssi >= g_cfg.scan_threshold_dbm);
+            if (is_hit || millis() - g_hit_latch_ms > HIT_HOLD_MS) {
+                g_last_peak_freq   = peakFreq;
+                g_last_peak_rssi   = peakRssi;
+                g_last_peak_is_hit = is_hit;
+                if (is_hit) {
+                    g_hit_latch_ms       = millis();
+                    g_scan_hit_flag      = true;
+                    g_cfg.frequency_mhz  = peakFreq;
+                }
+            }
             if (g_cfg.verbose) {
-                Serial.printf("[SWEEP %4lu] %4lu ms | peak %.3f @ %d dBm\n",
-                              (unsigned long)s_sweep, (unsigned long)(millis()-s_t0),
-                              peakFreq, peakRssi);
+                Serial.printf("[SWEEP %4lu] %4lu ms | peak %.3f @ %d dBm%s\n",
+                              (unsigned long)s_scan_sweep, (unsigned long)(millis()-s_scan_t0),
+                              peakFreq, peakRssi, is_hit ? "  <== HIT" : "");
             }
         }
         return;
     }
 
-    // Non-blocking: SCAN_STEP tần số / lần gọi
-    const size_t SCAN_STEP = 2;  // ★ v2: giảm step để đọc nút nhanh hơn
-    g_capturing = false;
+    const size_t SCAN_STEP = scan_band_step();
 
-    if (s_idx == 0) {
-        s_peakFreq = 0;
-        s_peakRssi = -200;
-        s_t0 = millis();
+    if (s_scan_idx == 0) {
+        s_scan_peakFreq = 0;
+        s_scan_peakRssi = -200;
+        s_scan_t0 = millis();
     }
 
-    size_t end = s_idx + SCAN_STEP;
-    if (end > FREQ_COUNT) end = FREQ_COUNT;
+    size_t end = s_scan_idx + SCAN_STEP;
+    if (end > count) end = count;
 
-    for (size_t i = s_idx; i < end; i++) {
-        float f = FREQ_LIST[i];
-        cc_strobe(CC_SIDLE); delayMicroseconds(200);
-        cc_set_freq_regs(f);
-        cc_strobe(CC_SFRX); cc_strobe(CC_SRX);
-        delay(g_cfg.settle_time_ms);
-        int rssi = cc_read_rssi_dbm();
-        if (rssi > s_peakRssi) {
-            s_peakRssi = rssi;
-            s_peakFreq = f;
+    for (size_t i = s_scan_idx; i < end; i++) {
+        int rssi = scan_probe_rssi_ex(list[i], settle);
+        if (rssi > s_scan_peakRssi) {
+            s_scan_peakRssi = rssi;
+            s_scan_peakFreq = list[i];
         }
     }
-    s_idx = end;
-    if (s_idx >= FREQ_COUNT) {
-        s_sweep++;
-        g_last_peak_freq = s_peakFreq;
-        g_last_peak_rssi = s_peakRssi;
-        s_idx = 0;
+    s_scan_idx = end;
+    if (s_scan_idx >= count) {
+        s_scan_sweep++;
+        bool is_hit = (s_scan_peakRssi >= g_cfg.scan_threshold_dbm);
+        if (is_hit || millis() - g_hit_latch_ms > HIT_HOLD_MS) {
+            g_last_peak_freq   = s_scan_peakFreq;
+            g_last_peak_rssi   = s_scan_peakRssi;
+            g_last_peak_is_hit = is_hit;
+            if (is_hit) {
+                g_hit_latch_ms       = millis();
+                g_scan_hit_flag      = true;
+                g_cfg.frequency_mhz  = s_scan_peakFreq;
+            }
+        }
+        s_scan_idx = 0;
     }
 }
 
@@ -843,6 +885,16 @@ static void capture_iteration() {
     static uint8_t  lvl[RF_LISTEN_MAX_EDGES];
     static uint32_t lastCheck = 0;
 
+    // ★ DEBUG tạm thời — xóa sau khi xác định xong nguyên nhân
+    static uint32_t lastLog = 0;
+    if (millis() - lastLog > 500) {
+        lastLog = millis();
+        Serial.printf("[DBG] edges=%u overflow=%lu marc=0x%02X rssi=%d\n",
+                      g_edgeCount, (unsigned long)g_overflow,
+                      cc_read_status(CC_MARCSTATE) & 0x1F,
+                      cc_read_rssi_dbm());
+    }
+
     uint16_t n = g_edgeCount;
     if (n >= RF_LISTEN_MAX_EDGES - 2) {
         noInterrupts();
@@ -857,7 +909,6 @@ static void capture_iteration() {
     }
 
     if (n > 0 && (millis() - g_lastEdgeMs) > g_cfg.frame_gap_ms) {
-        // ★ v2: đọc RSSI ngay trước khi xử lý
         int8_t rssi = (int8_t)cc_read_rssi_dbm();
         noInterrupts();
         uint16_t cnt = g_edgeCount;
@@ -870,7 +921,6 @@ static void capture_iteration() {
         if (valid >= 5) decode_frame(dur, lvl, cnt, true, rssi);
     }
 
-    // Watchdog: khôi phục RX nếu chip thoát khỏi RX state
     if (millis() - lastCheck > 2000) {
         lastCheck = millis();
         uint8_t ms = cc_read_status(CC_MARCSTATE) & 0x1F;
@@ -900,6 +950,9 @@ bool rf_listen_begin(const RFListenerConfig &cfg) {
     g_cfg = cfg;
     g_initialized = false;
     g_chip_ok = false;
+    g_hit_latch_ms = 0;
+    g_scan_hit_flag = false;
+    g_last_peak_is_hit = false;
     SPI.setSCK(cfg.pin_sck);
     SPI.setTX (cfg.pin_mosi);
     SPI.setRX (cfg.pin_miso);
@@ -945,8 +998,21 @@ void rf_listen_set_mode(RFListenMode mode) {
             detachInterrupt(digitalPinToInterrupt(g_cfg.pin_gdo0));
         }
     }
+    if (mode == RF_LISTEN_SCAN && g_mode != RF_LISTEN_SCAN) {
+        g_hit_latch_ms = 0;
+        g_scan_hit_flag = false;
+        g_last_peak_is_hit = false;
+        scan_state_reset();
+    }
     g_mode = mode;
 }
+
+void rf_listen_set_scan_band(RFScanBand band) {
+    if (g_scan_band == band) return;
+    g_scan_band = band;
+    scan_state_reset();
+}
+RFScanBand rf_listen_get_scan_band() { return g_scan_band; }
 RFListenMode rf_listen_get_mode() { return g_mode; }
 bool rf_listen_is_confirmed()     { return g_last_confirmed; }
 bool rf_listen_has_result()       { return g_has_result; }
@@ -962,6 +1028,13 @@ void rf_listen_set_nonblocking(bool nb) { g_nonblocking = nb; }
 bool rf_listen_is_nonblocking()         { return g_nonblocking; }
 float rf_listen_get_last_peak_freq()    { return g_last_peak_freq; }
 int   rf_listen_get_last_peak_rssi()    { return g_last_peak_rssi; }
+bool  rf_listen_last_peak_is_hit()      { return g_last_peak_is_hit; }
+
+bool rf_listen_scan_hit_pop() {
+    bool h = g_scan_hit_flag;
+    g_scan_hit_flag = false;
+    return h;
+}
 
 void rf_listen_set_frequency(float mhz) {
     if (mhz < 280 || mhz > 928) return;
@@ -996,15 +1069,15 @@ static void print_status(Stream &out) {
 }
 
 static void print_help(Stream &out) {
-    out.println(F("\n=== RF Listen CLI v2 ==="));
+    out.println(F("\n=== RF Listen CLI v3.1 ==="));
     out.println(F("  s         - SCAN mode"));
     out.println(F("  c         - CAPTURE mode"));
     out.println(F("  f <mhz>   - đổi tần số"));
-    out.println(F("  t <-dBm>  - ngưỡng scan (vd: t -70)"));
+    out.println(F("  t <-dBm>  - ngưỡng scan"));
     out.println(F("  g <ms>    - frame gap"));
     out.println(F("  n <us>    - noise filter"));
     out.println(F("  w <ms>    - settle time"));
-    out.println(F("  a 0/1     - AGC mode (1=sensitive)"));
+    out.println(F("  a 0/1     - AGC mode"));
     out.println(F("  r         - reset cache"));
     out.println(F("  p         - print config"));
     out.println(F("  d         - dump CC1101 regs"));
@@ -1047,7 +1120,6 @@ bool rf_listen_handle_serial(Stream &in) {
         } break; }
         case 'a': { int v = arg.toInt();
             g_cfg.agc_sensitive = (v != 0);
-            // Áp dụng lại AGC ngay
             if (g_chip_ok) {
                 if (g_cfg.agc_sensitive) {
                     cc_write(CC_AGCCTRL2, 0x03);

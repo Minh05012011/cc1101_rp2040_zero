@@ -34,7 +34,10 @@
 #define RF_REPLAY_MAX_COMMANDS    32
 #define RF_REPLAY_MAX_BUTTONS     12
 #define RF_REPLAY_NAME_LEN        20
-
+// Thêm vào cuối file, trước #endif
+// Jam 1 tần số trong dwell_ms (đổi freq + TX + phát noise + về idle)
+// ook_noise = true: OOK noise (khuyến nghị) | false: carrier thuần
+void rf_replay_jam_dwell(float freq_mhz, uint16_t dwell_ms, bool ook_noise = true);
 // ---------------------------------------------------------------------------
 // Error codes
 // ---------------------------------------------------------------------------
@@ -221,4 +224,7 @@ void rf_replay_transmit_bit_low(uint16_t duration_us);
 // repeats: số lần lặp
 void rf_replay_transmit_raw_bits(const uint8_t* bits, uint32_t len,
                                  uint16_t T_us, uint16_t repeats = 1);
+                                 // ★ RAW edges replay (dùng cho SavedCode.mode == SAVED_MODE_RAW)
+bool rf_replay_send_raw_edges(const uint32_t* dur, const uint8_t* lvl,
+                              uint16_t count, uint16_t repeats);
 #endif // RF_REPLAY_H

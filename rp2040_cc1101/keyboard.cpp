@@ -2,41 +2,39 @@
 #include "hardware.h"
 #include "config.h"
 #include <math.h>
+#include <string.h>
+#include <stdlib.h>
 
 namespace Keyboard {
 
-static KMode    _mode  = KMODE_NONE;
+static KMode    _mode   = KMODE_NONE;
 static int      _result = 0;
 
-// Text
 static char     _text_buf[48];
 static size_t   _text_max = 0;
 static size_t   _text_len = 0;
-static size_t   _text_cur = 0;   // cursor position
+static size_t   _text_cur = 0;
 static int      _layout_row = 0;
 static int      _layout_col = 0;
 
-// Number
 static float    _num_val   = 0.0f;
 static float    _num_step  = 1.0f;
 static float    _num_min   = 0.0f;
 static float    _num_max   = 100.0f;
 static int      _num_dec   = 0;
-static int      _num_field = 0;   // 0=whole, 1=decimal
+static int      _num_field = 0;
 static char     _num_buf[20];
 
-// Common
 static char     _title[24] = {0};
 static bool     _redraw = true;
 
 // ---------------------------------------------------------------------------
-// Layouts
+// QWERTY layout
 // ---------------------------------------------------------------------------
-// 3 hàng chữ hoa & số đồng đều 13 ký tự mỗi hàng:
 static const char* TEXT_ROWS[3] = {
-    "ABCDEFGHIJKLM",
-    "NOPQRSTUVWXYZ",
-    "0123456789.-_"
+    "QWERTYUIOPASD",
+    "FGHJKLZXCVBNM",
+    "1234567890.-_",
 };
 
 struct KeyRepeat {
@@ -47,9 +45,27 @@ struct KeyRepeat {
 };
 static KeyRepeat _left_repeat, _right_repeat;
 
+static void flush_and_wait_release() {
+    HW::get_event(HW::BTN_LEFT);
+    HW::get_event(HW::BTN_MID);
+    HW::get_event(HW::BTN_RIGHT);
+
+    uint32_t t0 = millis();
+    while ((HW::is_pressed(HW::BTN_LEFT) ||
+            HW::is_pressed(HW::BTN_MID)  ||
+            HW::is_pressed(HW::BTN_RIGHT)) &&
+           (millis() - t0 < 600)) {
+        HW::buttons_tick();
+        delay(5);
+    }
+    HW::get_event(HW::BTN_LEFT);
+    HW::get_event(HW::BTN_MID);
+    HW::get_event(HW::BTN_RIGHT);
+}
+
 static int text_row_count(int row) {
     if (row < 3) return 13;
-    return 4; // DEL, SPACE, CLR, OK
+    return 4;
 }
 
 static bool repeat_navigation(HW::Btn button, HW::Ev event, KeyRepeat& r) {
@@ -77,50 +93,27 @@ static bool repeat_navigation(HW::Btn button, HW::Ev event, KeyRepeat& r) {
 
 static void text_move(int direction) {
     if (direction < 0) {
-        if (_layout_col > 0) {
-            --_layout_col;
-        } else if (_layout_row > 0) {
-            --_layout_row;
-            _layout_col = text_row_count(_layout_row) - 1;
-        } else {
-            _layout_row = 3;
-            _layout_col = 3;
-        }
+        if (_layout_col > 0) --_layout_col;
+        else if (_layout_row > 0) { --_layout_row; _layout_col = text_row_count(_layout_row) - 1; }
+        else { _layout_row = 3; _layout_col = 3; }
     } else {
-        if (_layout_col + 1 < text_row_count(_layout_row)) {
-            ++_layout_col;
-        } else if (_layout_row < 3) {
-            ++_layout_row;
-            _layout_col = 0;
-        } else {
-            _layout_row = 0;
-            _layout_col = 0;
-        }
+        if (_layout_col + 1 < text_row_count(_layout_row)) ++_layout_col;
+        else if (_layout_row < 3) { ++_layout_row; _layout_col = 0; }
+        else { _layout_row = 0; _layout_col = 0; }
     }
     _redraw = true;
 }
 
-// Number layout
 static const char NUM_KEYS[4][3] = {
-    {'7','8','9'},
-    {'4','5','6'},
-    {'1','2','3'},
-    {'0','.','<'}
+    {'7','8','9'}, {'4','5','6'}, {'1','2','3'}, {'0','.','<'}
 };
 
-// ---------------------------------------------------------------------------
 bool is_active() { return _mode != KMODE_NONE; }
 int  result()    { return _result; }
+void begin()     { _mode = KMODE_NONE; _result = 0; }
 
-void begin() {
-    _mode   = KMODE_NONE;
-    _result = 0;
-}
-
-// ---------------------------------------------------------------------------
-// Text helpers
-// ---------------------------------------------------------------------------
 static void text_insert(char c) {
+    if (c == 0) return;
     if (_text_len >= _text_max - 1) return;
     if (_text_cur < _text_len) {
         memmove(&_text_buf[_text_cur + 1], &_text_buf[_text_cur],
@@ -132,31 +125,20 @@ static void text_insert(char c) {
     _text_buf[_text_len] = 0;
     _redraw = true;
 }
-
 static void text_backspace() {
     if (_text_cur == 0) return;
     memmove(&_text_buf[_text_cur - 1], &_text_buf[_text_cur],
             _text_len - _text_cur + 1);
-    _text_len--;
-    _text_cur--;
-    _redraw = true;
+    _text_len--; _text_cur--; _redraw = true;
 }
-
 static void text_clear() {
-    _text_buf[0] = 0;
-    _text_len = 0;
-    _text_cur = 0;
-    _redraw = true;
+    _text_buf[0] = 0; _text_len = 0; _text_cur = 0; _redraw = true;
 }
 
-// ---------------------------------------------------------------------------
-// Text Render
-// ---------------------------------------------------------------------------
 static void text_render() {
     auto& d = HW::oled;
     d.clearDisplay();
 
-    // 1. Text field box (Blue zone y=17..27)
     d.drawRoundRect(2, 17, 124, 11, 2, SSD1306_WHITE);
     const size_t viewChars = 19;
     size_t start = (_text_cur > viewChars - 1) ? _text_cur - (viewChars - 1) : 0;
@@ -179,12 +161,10 @@ static void text_render() {
     if (_text_cur == _text_len && _text_cur < start + viewChars) {
         d.fillRect(x - 1, 18, 6, 9, SSD1306_WHITE);
         d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-        d.setCursor(x, 19);
-        d.write(' ');
+        d.setCursor(x, 19); d.write(' ');
     }
     d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
 
-    // 2. Keyboard keys (y=29..53)
     const int rowY[3] = {29, 37, 45};
     for (int r = 0; r < 3; ++r) {
         const char* keys = TEXT_ROWS[r];
@@ -203,7 +183,6 @@ static void text_render() {
         }
     }
 
-    // 3. Action row (y=54..62)
     const int by = 54;
     const int bx[4] = {3, 31, 68, 97};
     const int bw[4] = {26, 35, 27, 28};
@@ -218,37 +197,29 @@ static void text_render() {
             d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
         }
         int lx = bx[c] + (bw[c] - (int)strlen(labels[c]) * 6) / 2;
-        d.setCursor(lx, by + 1);
-        d.print(labels[c]);
+        d.setCursor(lx, by + 1); d.print(labels[c]);
     }
 
-    // 4. Header vàng vẽ SAU CÙNG để luôn đè lên trên cùng (y=0..15)
     d.fillRect(0, 0, 128, 16, SSD1306_BLACK);
     d.fillRect(0, 0, 128, 15, SSD1306_WHITE);
     d.setTextSize(1);
     d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    d.setCursor(3, 4);
-    d.print(_title);
+    d.setCursor(3, 4); d.print(_title);
 
     char counter[12];
-    snprintf(counter, sizeof(counter), "%u/%u", (unsigned)_text_len, (unsigned)(_text_max > 1 ? _text_max - 1 : 0));
+    snprintf(counter, sizeof(counter), "%u/%u",
+             (unsigned)_text_len,
+             (unsigned)(_text_max > 1 ? _text_max - 1 : 0));
     int cx = 125 - (int)strlen(counter) * 6;
-    d.setCursor(cx, 4);
-    d.print(counter);
+    d.setCursor(cx, 4); d.print(counter);
     d.drawFastHLine(0, 15, 128, SSD1306_BLACK);
 
     d.display();
 }
 
-// ---------------------------------------------------------------------------
-// Number helpers & render
-// ---------------------------------------------------------------------------
 static void num_to_buf() {
-    if (_num_dec > 0) {
-        snprintf(_num_buf, sizeof(_num_buf), "%.*f", _num_dec, _num_val);
-    } else {
-        snprintf(_num_buf, sizeof(_num_buf), "%d", (int)_num_val);
-    }
+    if (_num_dec > 0) snprintf(_num_buf, sizeof(_num_buf), "%.*f", _num_dec, _num_val);
+    else              snprintf(_num_buf, sizeof(_num_buf), "%d", (int)_num_val);
 }
 
 static void num_apply_digit(char k) {
@@ -260,15 +231,11 @@ static void num_apply_digit(char k) {
             _num_val = floorf(_num_val / 10.0f);
         }
         if (_num_val < _num_min) _num_val = _num_min;
-        num_to_buf();
-        _redraw = true;
-        return;
+        num_to_buf(); _redraw = true; return;
     }
     if (k == '.') {
         if (_num_dec == 0) _num_dec = 2;
-        num_to_buf();
-        _redraw = true;
-        return;
+        num_to_buf(); _redraw = true; return;
     }
     int d = k - '0';
     if (_num_field == 0) {
@@ -279,24 +246,19 @@ static void num_apply_digit(char k) {
         _num_val += (float)d / m;
         if (_num_val > _num_max) _num_val = _num_max;
     }
-    num_to_buf();
-    _redraw = true;
+    num_to_buf(); _redraw = true;
 }
 
 static void num_render() {
     auto& d = HW::oled;
     d.clearDisplay();
 
-    // Value display
     d.setTextSize(2);
     d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    d.setCursor(6, 18);
-    d.print(_num_buf);
+    d.setCursor(6, 18); d.print(_num_buf);
     d.setTextSize(1);
-
     d.drawFastHLine(0, 34, 128, SSD1306_WHITE);
 
-    // Keypad (y=36..62)
     for (int r = 0; r < 4; ++r) {
         const int y = 36 + r * 7;
         for (int c = 0; c < 3; ++c) {
@@ -309,26 +271,20 @@ static void num_render() {
                 d.drawRoundRect(x - 8, y, 20, 7, 1, SSD1306_WHITE);
                 d.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
             }
-            d.setCursor(x, y);
-            d.write((uint8_t)NUM_KEYS[r][c]);
+            d.setCursor(x, y); d.write((uint8_t)NUM_KEYS[r][c]);
         }
     }
 
-    // Top Header (Yellow zone) vẽ sau cùng
     d.fillRect(0, 0, 128, 16, SSD1306_BLACK);
     d.fillRect(0, 0, 128, 15, SSD1306_WHITE);
     d.setTextSize(1);
     d.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    d.setCursor(3, 4);
-    d.print(_title);
-    d.setCursor(85, 4);
-    d.print("[NUM]");
+    d.setCursor(3, 4); d.print(_title);
+    d.setCursor(85, 4); d.print("[NUM]");
     d.drawFastHLine(0, 15, 128, SSD1306_BLACK);
-
     d.display();
 }
 
-// ---------------------------------------------------------------------------
 static void render() {
     if (_mode == KMODE_TEXT)        text_render();
     else if (_mode == KMODE_NUMBER) num_render();
@@ -337,10 +293,8 @@ static void render() {
 static void open_common(const char* title) {
     strncpy(_title, title, sizeof(_title) - 1);
     _title[sizeof(_title) - 1] = 0;
-    _layout_row = 0;
-    _layout_col = 0;
-    _redraw = true;
-    _result = 0;
+    _layout_row = 0; _layout_col = 0;
+    _redraw = true; _result = 0;
     _left_repeat = KeyRepeat{};
     _right_repeat = KeyRepeat{};
 }
@@ -355,39 +309,34 @@ void open_text(const char* title, const char* initial, char* out, size_t max_len
     _text_cur = _text_len;
 }
 
-// ---------------------------------------------------------------------------
-// Run loop
-// ---------------------------------------------------------------------------
 static void run_loop() {
+    HW::led_set_mode(HW::LED_SOLID);
     HW::led_set_color(60, 60, 0);
+    _redraw = true;
     while (_result == 0) {
         HW::buttons_tick();
         HW::led_tick();
 
-        if (_redraw) {
-            render();
-            _redraw = false;
-        }
+        if (_redraw) { render(); _redraw = false; }
 
         HW::Ev eL = HW::get_event(HW::BTN_LEFT);
         HW::Ev eM = HW::get_event(HW::BTN_MID);
         HW::Ev eR = HW::get_event(HW::BTN_RIGHT);
 
         if (_mode == KMODE_TEXT) {
-            if (repeat_navigation(HW::BTN_LEFT, eL, _left_repeat))   text_move(-1);
+            if (repeat_navigation(HW::BTN_LEFT,  eL, _left_repeat))  text_move(-1);
             if (repeat_navigation(HW::BTN_RIGHT, eR, _right_repeat)) text_move(+1);
 
             if (eM == HW::EV_CLICK) {
-                if (_layout_row < 3) {
-                    text_insert(TEXT_ROWS[_layout_row][_layout_col]);
-                } else {
-                    if (_layout_col == 0)      text_backspace();
+                if (_layout_row < 3) text_insert(TEXT_ROWS[_layout_row][_layout_col]);
+                else {
+                    if      (_layout_col == 0) text_backspace();
                     else if (_layout_col == 1) text_insert(' ');
                     else if (_layout_col == 2) text_clear();
-                    else                       _result = 1; // OK / SAVE
+                    else                       _result = 1;
                 }
             }
-            if (eM == HW::EV_LONG) _result = -1; // Cancel
+            if (eM == HW::EV_LONG) _result = -1;
         }
         else if (_mode == KMODE_NUMBER) {
             if (eL == HW::EV_CLICK) {
@@ -405,15 +354,14 @@ static void run_loop() {
             if (eL == HW::EV_LONG) { _result = -1; }
             if (eR == HW::EV_LONG) { _result = 1; }
         }
-
         delay(5);
     }
 }
 
 bool input_text(const char* title, const char* initial, char* out, size_t max_len) {
+    flush_and_wait_release();
     open_text(title, initial, out, max_len);
     run_loop();
-
     if (_result == 1 && out) {
         strncpy(out, _text_buf, max_len - 1);
         out[max_len - 1] = 0;
@@ -426,17 +374,15 @@ void open_number(const char* title, float initial, float* out,
                  float step, float min, float max, int decimals) {
     open_common(title);
     _mode = KMODE_NUMBER;
-    _num_val = initial;
-    _num_step = step;
-    _num_min = min;
-    _num_max = max;
-    _num_dec = decimals;
-    _num_field = 0;
+    _num_val = initial; _num_step = step;
+    _num_min = min; _num_max = max;
+    _num_dec = decimals; _num_field = 0;
     num_to_buf();
 }
 
 bool input_number(const char* title, float initial, float* out,
                   float step, float min, float max, int decimals) {
+    flush_and_wait_release();
     open_number(title, initial, out, step, min, max, decimals);
     run_loop();
     if (_result == 1 && out) {
@@ -448,11 +394,79 @@ bool input_number(const char* title, float initial, float* out,
     return _result == 1;
 }
 
-void close() {
-    _mode = KMODE_NONE;
-    _result = 0;
+// ===========================================================================
+// ★ NEW: nhập float qua QWERTY
+// ===========================================================================
+bool input_float_text(const char* title, float initial, float* out,
+                      float min, float max) {
+    char init_buf[24];
+    snprintf(init_buf, sizeof(init_buf), "%.3f", initial);
+    char in_buf[24] = {0};
+
+    if (!input_text(title, init_buf, in_buf, sizeof(in_buf))) return false;
+
+    // Trim leading space
+    char* p = in_buf;
+    while (*p == ' ') p++;
+    if (*p == 0) return false;
+
+    // Replace ',' with '.' (nếu user nhập nhầm)
+    for (char* q = p; *q; ++q) if (*q == ',') *q = '.';
+
+    char* endp = nullptr;
+    float v = strtof(p, &endp);
+    if (endp == p) return false;
+
+    if (v < min) v = min;
+    if (v > max) v = max;
+    if (out) *out = v;
+    return true;
 }
 
-void tick() {}
+// ===========================================================================
+// ★ NEW: nhập range "a-b" qua QWERTY
+// ===========================================================================
+bool input_range_text(const char* title, float init_start, float init_stop,
+                      float* out_start, float* out_stop, float min, float max) {
+    char init_buf[40];
+    snprintf(init_buf, sizeof(init_buf), "%.1f-%.1f", init_start, init_stop);
+    char in_buf[40] = {0};
+
+    if (!input_text(title, init_buf, in_buf, sizeof(in_buf))) return false;
+
+    char* p = in_buf;
+    while (*p == ' ') p++;
+    if (*p == 0) return false;
+
+    // Replace ',' with '.'
+    for (char* q = p; *q; ++q) if (*q == ',') *q = '.';
+
+    char* dash = strchr(p, '-');
+    if (!dash) return false;
+
+    *dash = 0;
+    char* p1 = p;
+    char* p2 = dash + 1;
+    while (*p2 == ' ') p2++;
+    if (*p1 == 0 || *p2 == 0) return false;
+
+    char* endp1 = nullptr;
+    char* endp2 = nullptr;
+    float v1 = strtof(p1, &endp1);
+    float v2 = strtof(p2, &endp2);
+    if (endp1 == p1 || endp2 == p2) return false;
+
+    if (v1 > v2) { float t = v1; v1 = v2; v2 = t; }
+    if (v1 < min) v1 = min;
+    if (v2 > max) v2 = max;
+    if (v1 >= v2) return false;
+
+    if (out_start) *out_start = v1;
+    if (out_stop)  *out_stop  = v2;
+    return true;
+}
+
+void close() { _mode = KMODE_NONE; _result = 0; }
+void tick()  {}
 
 } // namespace Keyboard

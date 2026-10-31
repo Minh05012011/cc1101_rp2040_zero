@@ -1,8 +1,7 @@
 /*
  * ============================================================================
- *  RF Listener Library — RP2040 + CC1101  v2.0
- *  Cải tiến: scan sensitivity cao hơn, capture thông minh hơn,
- *             multi-protocol decoder, AGC tốt hơn.
+ *  RF Listener Library — RP2040 + CC1101  v3.0
+ *  v3: Fast scan (peak-hold, refine, hold hiển thị 5.5s), fix hiển thị dBm
  * ============================================================================
  */
 
@@ -12,7 +11,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 
-#define RF_LISTEN_VERSION "2.0.0"
+#define RF_LISTEN_VERSION "3.0.0"
 
 // ---------------------------------------------------------------------------
 // Giới hạn
@@ -81,6 +80,16 @@ enum RFListenMode {
 };
 
 // ---------------------------------------------------------------------------
+// ★ v3.1: Scan band — toàn dải (như trước) hoặc dải nhanh 433+315 MHz
+// (phổ biến nhất cho remote), quét trọn 1 lượt mỗi update() để bắt được
+// 1 lần bấm duy nhất thay vì phải giữ nút.
+// ---------------------------------------------------------------------------
+enum RFScanBand {
+    RF_SCAN_BAND_ALL  = 0,   // toàn dải tần hỗ trợ (chậm hơn, bao phủ rộng)
+    RF_SCAN_BAND_FAST = 1    // chỉ 433 MHz + 315 MHz (nhanh nhất, 1 lần bấm)
+};
+
+// ---------------------------------------------------------------------------
 // Callback
 // ---------------------------------------------------------------------------
 typedef void (*RFListenCallback)(const RFResult &result, void *user_data);
@@ -102,9 +111,20 @@ uint16_t rf_listen_snapshot_recent_edges(uint32_t* dur, uint8_t* lvl, uint16_t m
 
 void rf_listen_set_mode(RFListenMode mode);
 RFListenMode rf_listen_get_mode();
+
+// ★ v3.1: chọn dải quét cho SCAN mode (gọi trước hoặc trong lúc SCAN)
+void  rf_listen_set_scan_band(RFScanBand band);
+RFScanBand rf_listen_get_scan_band();
 bool rf_listen_is_confirmed();
 float rf_listen_get_last_peak_freq();
 int   rf_listen_get_last_peak_rssi();
+
+// ★ v3: true chỉ khi peak hiện tại là 1 tín hiệu thật (>= threshold),
+//        false khi đang "LISTENING..." / chỉ là nhiễu nền.
+bool  rf_listen_last_peak_is_hit();
+// ★ v3: trả về true đúng 1 lần ngay khi scan vừa phát hiện 1 hit mới
+//        (tần số đã được khóa sẵn vào cfg, sẵn sàng chuyển CAPTURE).
+bool  rf_listen_scan_hit_pop();
 
 bool rf_listen_has_result();
 RFResult rf_listen_get_result();

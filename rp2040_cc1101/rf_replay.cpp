@@ -244,8 +244,8 @@ static bool cc_hardware_init() {
     }
 
     // ---- Registers cho OOK async TX ----
-    cc_write(CC_IOCFG0,   0x02);   // GDO0 = serial TX data (async)
-    cc_write(CC_IOCFG2,   0x0D);   // GDO2 = serial RX data
+    cc_write(CC_IOCFG0,   0x2E);   // GDO0 = Tri-state input (RP2040 feeds async TX data)
+    cc_write(CC_IOCFG2,   0x2E);   // GDO2 = Tri-state
     cc_write(CC_FIFOTHR,  0x47);
     cc_write(CC_PKTCTRL0, 0x32);   // async serial, infinite packet
     cc_write(CC_PKTCTRL1, 0x00);
@@ -633,7 +633,141 @@ void rf_replay_transmit_bit_high(uint16_t duration_us) {
     delayMicroseconds(duration_us);
     digitalWrite(g_cfg.pin_gdo0, LOW);
 }
+// ★ Phát lại edges thô — dùng cho SavedCode.mode == SAVED_MODE_RAW
+bool rf_replay_send_raw_edges(const uint32_t* dur, const uint8_t* lvl,
+                              uint16_t count, uint16_t repeats) {
+    if (!g_chip_present) { g_last_error = RF_ERR_NOT_INIT; return false; }
+    if (!dur || !lvl || count == 0) {
+        g_last_error = RF_ERR_INVALID_PARAM; return false;
+    }
+    if (repeats == 0) repeats = 1;
+    if (count > 2048) count = 2048;
 
+    // Đảm bảo CC1101 ở cấu hình Async OOK TX
+    cc_write(CC_IOCFG0,   0x2E);   // GDO0 = Tri-state input (RP2040 feeds TX pulse)
+    cc_write(CC_IOCFG2,   0x2E);
+    cc_write(CC_PKTCTRL0, 0x32);   // Async serial mode
+    cc_write(CC_MDMCFG2,  0x30);   // ASK/OOK, no sync
+    cc_write(CC_FREND0,   0x11);   // PA table 0 & 1
+
+    if (!cc_enter_tx_sync(15)) {
+        cc_strobe(CC_SIDLE);
+        delayMicroseconds(100);
+        cc_strobe(CC_SCAL);
+        delay(5);
+        cc_strobe(CC_STX);
+        delay(2);
+        uint8_t ms = cc_read_status(CC_MARCSTATE) & 0x1F;
+        if (ms != MARC_TX && ms != MARC_TX_END && ms != MARC_TX_UNDER) {
+            g_last_error = RF_ERR_BUSY;
+            Serial.printf("[TX-RAW] enter_tx FAIL MARC=0x%02X\n", ms);
+            return false;
+        }
+    }
+
+    pinMode(g_cfg.pin_gdo0, OUTPUT);
+    digitalWrite(g_cfg.pin_gdo0, LOW);
+    delayMicroseconds(50); // PA ramp-up
+
+    // Bỏ qua xung đầu tiên nếu là thời gian chờ tĩnh trước frame (> 10ms mức LOW)
+    uint16_t start_idx = 0;
+    if (count > 2 && lvl[0] == 0 && dur[0] > 10000) {
+        start_idx = 1;
+    }
+
+    // Tính tổng thời gian 1 frame
+    uint64_t frame_us = 0;
+    for (uint16_t i = start_idx; i < count; i++) frame_us += dur[i];
+
+    // Giới hạn tổng thời gian phát an toàn ~1.5 - 2s
+    if (frame_us > 0 && frame_us * repeats > 2000000ULL) {
+        uint32_t calc = 2000000ULL / frame_us;
+        if (calc < 3)  calc = 3;
+        if (calc > 20) calc = 20;
+        Serial.printf("[TX-RAW] auto repeat: %u → %u\n", repeats, (uint16_t)calc);
+        repeats = (uint16_t)calc;
+    }
+
+    Serial.printf("[TX-RAW] Bắt đầu phát RAW: %u xung × %u lần lặp (frame=%.2f ms)\n",
+                  count - start_idx, repeats, frame_us / 1000.0);
+
+    uint32_t t_start = millis();
+
+    for (uint16_t r = 0; r < repeats; r++) {
+        // Khóa ngắt trong thời gian phát 1 frame để đảm bảo độ chuẩn xác microsecond
+        noInterrupts();
+        for (uint16_t i = start_idx; i < count; i++) {
+            uint32_t d = dur[i];
+            if (d < 25)    d = 25;      // Min pulse an toàn
+            if (d > 50000) d = 50000;   // Max pulse an toàn
+            digitalWrite(g_cfg.pin_gdo0, lvl[i] ? HIGH : LOW);
+            uint32_t t0 = micros();
+            while ((micros() - t0) < d);
+        }
+        digitalWrite(g_cfg.pin_gdo0, LOW);
+        interrupts();
+
+        // Khoảng lặng nghỉ giữa các frame (Inter-frame gap 15ms)
+        if (r + 1 < repeats) {
+            delay(15);
+        }
+    }
+
+    // Trả lại trạng thái an toàn
+    digitalWrite(g_cfg.pin_gdo0, LOW);
+    pinMode(g_cfg.pin_gdo0, INPUT);
+    cc_strobe(CC_SIDLE);
+
+    Serial.printf("[TX-RAW] Hoàn thành trong %lu ms\n", (unsigned long)(millis() - t_start));
+    return true;
+}
+// Thêm vào cuối file
+void rf_replay_jam_dwell(float freq_mhz, uint16_t dwell_ms, bool ook_noise) {
+    if (!g_chip_present) return;
+
+    // 1. Đổi tần số (bao gồm PATABLE + SCAL) → hàm này đã STX vào TX mode
+    rf_replay_set_frequency(freq_mhz);
+    Serial.printf("[JAM] dwell @ %.3f MHz, MARC=0x%02X\n",
+                  freq_mhz, cc_read_status(CC_MARCSTATE) & 0x1F);
+    // 2. Verify TX mode (SCAL đôi khi fail)
+    uint8_t ms = cc_read_status(CC_MARCSTATE) & 0x1F;
+    if (ms != MARC_TX && ms != MARC_TX_END) {
+        if (!cc_enter_tx_sync(10)) {
+            cc_strobe(CC_SIDLE);
+            return;
+        }
+    }
+
+    // 3. Chuẩn bị GDO0 output
+    pinMode(g_cfg.pin_gdo0, OUTPUT);
+    digitalWrite(g_cfg.pin_gdo0, LOW);
+    delayMicroseconds(30);   // PA ramp-up
+
+    uint32_t start = millis();
+    static uint16_t lfsr = 0xACE1;   // LFSR seed — đổi giá trị này nếu muốn pattern khác
+
+    while ((millis() - start) < dwell_ms) {
+        if (ook_noise) {
+            // Burst 1ms OOK noise, toggle rate ~ 15–25 kHz
+            for (int i = 0; i < 20; i++) {
+                // PRBS-16 (x^16+x^14+x^13+x^11+1) — chu kỳ 65535
+                lfsr = (lfsr >> 1) |
+                       (((lfsr ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1) << 15);
+                digitalWrite(g_cfg.pin_gdo0, (lfsr & 1) ? HIGH : LOW);
+                delayMicroseconds(40 + (lfsr & 0x1F));   // 40–71 µs
+            }
+        } else {
+            // Carrier thuần (CW)
+            digitalWrite(g_cfg.pin_gdo0, HIGH);
+            delay(1);
+        }
+    }
+    digitalWrite(g_cfg.pin_gdo0, LOW);
+
+    // 4. Về IDLE để lần hop kế tiếp có thể SCAL sạch
+    cc_strobe(CC_SIDLE);
+    delayMicroseconds(100);
+}
 void rf_replay_transmit_bit_low(uint16_t duration_us) {
     if (!g_chip_present) return;
     digitalWrite(g_cfg.pin_gdo0, LOW);

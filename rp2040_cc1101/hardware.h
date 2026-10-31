@@ -18,7 +18,11 @@ enum LedMode {
     LED_SOLID,
     LED_BREATHE,
     LED_BLINK,
-    LED_FLASH
+    LED_FLASH,
+    LED_RAINBOW,
+    LED_JAM_CONT,
+    LED_JAM_DELAY_WAIT,
+    LED_JAM_DELAY_BURST
 };
 
 void led_set_mode(LedMode m);
@@ -29,6 +33,12 @@ void led_set_brightness(uint8_t b);
 void led_tick();
 void led_tx_ok();   // tím — phát OK
 void led_jammer();  // vàng solid — đang jammer
+void led_jam_continuous();
+void led_jam_delay_wait();
+void led_jam_delay_burst();
+void led_set_theme(uint8_t r, uint8_t g, uint8_t b);
+void led_rainbow();
+void led_btn_pop();
 // Preset colors
 void led_idle();
 void led_scan();
