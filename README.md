@@ -6,7 +6,7 @@ Firmware viết cho RP2040 (Arduino core), giao tiếp CC1101 qua SPI thủ côn
 
 ---
 
-## ⚠️ CẢNH BÁO QUAN TRỌNG — ĐỌC TRƯỚC KHI DÙNG
+## ⚠️ CẢNH BÁO QUAN TRỌNG 
 
 ### Brute Force (5 protocol) và De Bruijn: KHÔNG hoạt động thực tế — chỉ DEMO
 
